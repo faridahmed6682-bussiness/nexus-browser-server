@@ -543,7 +543,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'nexus-browser-worker',
-    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations'],
+    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations'],
   });
 });
 
