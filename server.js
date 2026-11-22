@@ -20,9 +20,22 @@
  * must be scripted as steps (goto -> type user -> type pass -> click) every
  * time. Credentials pass through the server in the request; they are never
  * stored or logged.
+ *
+ * GitHub App support (optional): the Nexus app can connect to GitHub the
+ * way Meta Muse does — via a GitHub App installation instead of a personal
+ * token. GitHub sends installation events to POST /github/webhook (verified
+ * with GITHUB_WEBHOOK_SECRET); the app requests a short-lived installation
+ * access token from POST /api/github/installation-token (auth: x-api-key),
+ * which this server mints by signing a JWT with GITHUB_APP_ID +
+ * GITHUB_APP_PRIVATE_KEY and exchanging it at api.github.com. Installation
+ * records live in memory and in github-installations.json (runtime state,
+ * never committed). All GitHub secrets come only from env vars.
  */
 
 const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -32,8 +45,19 @@ const API_KEY = process.env.BROWSER_WORKER_KEY || '';
 const STEP_TIMEOUT_DEFAULT = 15000;
 const MAX_TEXT_CHARS = 20000;
 
+// GitHub App credentials — env vars only, never hardcoded or logged.
+// The private key is often stored as one line with literal \n separators
+// (Railway/Render env vars); convert those to real newlines for crypto.
+const GITHUB_APP_ID = process.env.GITHUB_APP_ID || '';
+const GITHUB_APP_PRIVATE_KEY = (process.env.GITHUB_APP_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '';
+
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({
+  limit: '1mb',
+  // Keep the raw body: GitHub webhook signatures are computed over it.
+  verify: (req, res, buf) => { req.rawBody = buf; },
+}));
 
 // Minimal request log (no bodies, no headers — the API key must never be logged).
 app.use((req, res, next) => {
@@ -222,13 +246,114 @@ async function runRead(url) {
 }
 
 // ---------------------------------------------------------------------------
+// GitHub App support
+//
+//  1. GitHub sends installation events to POST /github/webhook. The HMAC
+//     SHA-256 signature (x-hub-signature-256) is verified against
+//     GITHUB_WEBHOOK_SECRET over the raw request body.
+//  2. Records live in memory and in github-installations.json (runtime
+//     state file, written on every event). Railway/Render filesystems are
+//     ephemeral without a volume, so the file is a convenience, not a
+//     guarantee — the app should treat an empty list as "unknown", not
+//     "no installations".
+//  3. POST /api/github/installation-token mints a short-lived installation
+//     access token (GitHub expires these within ~1 hour) by signing a JWT
+//     (RS256, max 10 min lifetime) and exchanging it at api.github.com.
+// ---------------------------------------------------------------------------
+const GITHUB_STATE_FILE = path.join(__dirname, 'github-installations.json');
+const MAX_RECENT_EVENTS = 50;
+
+// installationId (string) -> { installationId, account, repositories, status, updatedAt, lastEvent }
+const installations = new Map();
+let recentEvents = [];
+
+function loadInstallations() {
+  try {
+    if (!fs.existsSync(GITHUB_STATE_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(GITHUB_STATE_FILE, 'utf8'));
+    if (Array.isArray(data.installations)) {
+      for (const rec of data.installations) {
+        if (rec && rec.installationId) installations.set(String(rec.installationId), rec);
+      }
+    }
+    if (Array.isArray(data.recentEvents)) recentEvents = data.recentEvents.slice(0, MAX_RECENT_EVENTS);
+  } catch (err) {
+    console.warn('could not load GitHub installation state:', err.message);
+  }
+}
+
+function saveInstallations() {
+  try {
+    const tmp = GITHUB_STATE_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ installations: [...installations.values()], recentEvents }, null, 2));
+    fs.renameSync(tmp, GITHUB_STATE_FILE);
+  } catch (err) {
+    console.warn('could not save GitHub installation state:', err.message);
+  }
+}
+
+loadInstallations();
+
+function recordEvent(type, installationId, detail) {
+  recentEvents.unshift({
+    type,
+    installationId: installationId != null ? String(installationId) : null,
+    detail: detail || null,
+    at: new Date().toISOString(),
+  });
+  if (recentEvents.length > MAX_RECENT_EVENTS) recentEvents.length = MAX_RECENT_EVENTS;
+}
+
+function repoNames(repos) {
+  if (!Array.isArray(repos)) return [];
+  return repos.map((r) => (typeof r === 'string' ? r : r.full_name || r.name)).filter(Boolean);
+}
+
+function upsertInstallation(payload, eventType) {
+  const inst = payload.installation;
+  if (!inst || inst.id == null) return null;
+  const id = String(inst.id);
+  const existing = installations.get(id) || { installationId: id, repositories: [], status: 'active' };
+  if (inst.account) {
+    existing.account = { id: inst.account.id, login: inst.account.login, type: inst.account.type };
+  }
+  if (Array.isArray(payload.repositories)) existing.repositories = repoNames(payload.repositories);
+  existing.status = 'active';
+  existing.updatedAt = new Date().toISOString();
+  existing.lastEvent = eventType;
+  installations.set(id, existing);
+  return existing;
+}
+
+// -- Webhook signature (HMAC SHA-256 over the raw body, timing-safe) --------
+function verifyGitHubSignature(req) {
+  const signature = req.header('x-hub-signature-256') || '';
+  if (!signature.startsWith('sha256=')) return false;
+  const expected = 'sha256=' + crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET)
+    .update(req.rawBody || Buffer.alloc(0)).digest('hex');
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+// -- GitHub App JWT (RS256, issued 60s in the past, valid 9 minutes) ---------
+function buildGitHubAppJwt() {
+  const now = Math.floor(Date.now() / 1000);
+  const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const data = b64({ alg: 'RS256', typ: 'JWT' }) + '.' + b64({ iat: now - 60, exp: now + 540, iss: GITHUB_APP_ID });
+  const sig = crypto.sign('RSA-SHA256', Buffer.from(data), GITHUB_APP_PRIVATE_KEY);
+  return data + '.' + sig.toString('base64url');
+}
+
+// ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'nexus-browser-worker',
-    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read'],
+    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations'],
   });
 });
 
@@ -270,6 +395,117 @@ app.post('/api/read', requireAuth, async (req, res) => {
   } catch (err) {
     res.status(err.status || 500).json({ ok: false, error: String((err && err.message) || err) });
   }
+});
+
+// ---------------------------------------------------------------------------
+// GitHub App routes
+// ---------------------------------------------------------------------------
+
+// GitHub webhook receiver — NO x-api-key auth here (GitHub cannot send it);
+// the HMAC signature IS the auth. Events handled: installation
+// (created / deleted / new_permissions_accepted) and
+// installation_repositories (added / removed). Anything else (e.g. ping)
+// is acknowledged and ignored.
+app.post('/github/webhook', (req, res) => {
+  if (!GITHUB_WEBHOOK_SECRET) {
+    return res.status(503).json({ ok: false, error: 'GitHub webhook not configured: GITHUB_WEBHOOK_SECRET is not set' });
+  }
+  const event = req.header('x-github-event') || '';
+  if (!verifyGitHubSignature(req)) {
+    return res.status(401).json({ ok: false, error: 'bad webhook signature' });
+  }
+  const body = req.body || {};
+  const instId = body.installation && body.installation.id != null ? String(body.installation.id) : null;
+
+  if (event === 'installation') {
+    const action = body.action || '';
+    if (action === 'created' || action === 'new_permissions_accepted') {
+      const rec = upsertInstallation(body, 'installation.' + action);
+      recordEvent('installation.' + action, instId, rec && rec.account ? { account: rec.account.login, repositories: rec.repositories } : null);
+    } else if (action === 'deleted') {
+      const rec = installations.get(instId);
+      if (rec) {
+        rec.status = 'deleted';
+        rec.updatedAt = new Date().toISOString();
+        rec.lastEvent = 'installation.deleted';
+      }
+      recordEvent('installation.deleted', instId, rec && rec.account ? { account: rec.account.login } : null);
+    } else {
+      recordEvent('installation.' + action, instId, null);
+    }
+    saveInstallations();
+    return res.json({ ok: true, event });
+  }
+
+  if (event === 'installation_repositories') {
+    const rec = installations.get(instId);
+    const added = repoNames(body.repositories_added);
+    const removed = repoNames(body.repositories_removed);
+    if (rec) {
+      const set = new Set(rec.repositories);
+      added.forEach((r) => set.add(r));
+      removed.forEach((r) => set.delete(r));
+      rec.repositories = [...set];
+      rec.updatedAt = new Date().toISOString();
+      rec.lastEvent = 'installation_repositories.' + (body.action || '');
+    }
+    recordEvent('installation_repositories.' + (body.action || ''), instId, { added, removed });
+    saveInstallations();
+    return res.json({ ok: true, event });
+  }
+
+  return res.json({ ok: true, ignored: true, event });
+});
+
+// Mint a short-lived installation access token for the Nexus app.
+// Body: { "installationId": 12345678 } — the token is scoped to the repos
+// the GitHub App is installed on and expires within ~1 hour (GitHub-set).
+// The token is returned to the authenticated app only; it is never logged.
+app.post('/api/github/installation-token', requireAuth, async (req, res) => {
+  if (!GITHUB_APP_ID || !GITHUB_APP_PRIVATE_KEY) {
+    return res.status(503).json({ ok: false, error: 'GitHub App not configured: set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY' });
+  }
+  const rawId = (req.body || {}).installationId;
+  const installationId = typeof rawId === 'number' ? rawId : parseInt(String(rawId || ''), 10);
+  if (!Number.isInteger(installationId) || installationId <= 0) {
+    return res.status(400).json({ ok: false, error: 'installationId (a positive integer) is required' });
+  }
+  let jwt;
+  try {
+    jwt = buildGitHubAppJwt();
+  } catch (err) {
+    return res.status(503).json({ ok: false, error: 'could not sign GitHub App JWT — check GITHUB_APP_PRIVATE_KEY' });
+  }
+  try {
+    const ghRes = await fetch('https://api.github.com/app/installations/' + installationId + '/access_tokens', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + jwt,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'nexus-browser-worker',
+      },
+    });
+    const data = await ghRes.json().catch(() => ({}));
+    if (!ghRes.ok) {
+      return res.status(ghRes.status).json({ ok: false, error: 'GitHub API error: ' + (data.message || ghRes.statusText) });
+    }
+    res.json({ ok: true, token: data.token, expiresAt: data.expires_at, installationId });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: 'could not reach api.github.com: ' + err.message });
+  }
+});
+
+// List recorded installations + recent webhook events (auth: x-api-key).
+// An empty list means "no events seen yet" — not "nothing is installed":
+// the state file is ephemeral on free hosts without a volume.
+app.get('/api/github/installations', requireAuth, (req, res) => {
+  res.json({
+    ok: true,
+    installations: [...installations.values()],
+    recentEvents,
+    configured: Boolean(GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY && GITHUB_WEBHOOK_SECRET),
+  });
 });
 
 // JSON body errors (e.g. malformed JSON) as JSON, not an HTML page.

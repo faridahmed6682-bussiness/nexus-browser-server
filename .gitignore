@@ -1,0 +1,5 @@
+# Local secrets and runtime state — never commit.
+.env
+github-installations.json
+github-installations.json.tmp
+node_modules/

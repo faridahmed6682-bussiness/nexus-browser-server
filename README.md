@@ -128,6 +128,75 @@ the service stops. Move to Render (below) if that happens.
    app Settings (the generated value is shown once in the dashboard).
 3. Deploy. Test `/health` the same way as above.
 
+## GitHub App connect (optional)
+
+The Nexus app can connect to GitHub the way Meta Muse does — via a **GitHub
+App installation** instead of a personal token. The app never sees the App's
+private key: this server signs a JWT with it and mints a short-lived
+installation access token (GitHub expires these within ~1 hour), scoped to
+the repos the App is installed on.
+
+### 1. Register the GitHub App
+
+1. Go to https://github.com/settings/apps/new (as the account that owns the
+   repos — e.g. `faridahmed6682-bussiness`).
+2. **GitHub App name**: `Nexus AI` (any unique name works). **Homepage URL**:
+   your Railway URL. **Webhook URL**:
+   `https://<your-railway-url>/github/webhook` — **Active**, and set a
+   **Webhook secret** (generate one: `openssl rand -hex 32`).
+3. **Permissions** (Repository permissions):
+   - **Contents**: Read and write (commits, files)
+   - **Pull requests**: Read and write
+   - **Issues**: Read and write
+   - Metadata: Read-only (automatic).
+4. **Where can this GitHub App be installed?** — "Only on this account".
+5. Create the app, then on its settings page click **Generate a private
+   key** — download the `.pem` file. Note the **App ID** at the top.
+6. **Install** the App on the account (Install App → pick the account →
+   choose All repositories or selected ones).
+
+### 2. Set the env vars (Railway Variables)
+
+| Variable | Value |
+|---|---|
+| `GITHUB_APP_ID` | The App ID (number) from the App settings page. |
+| `GITHUB_APP_PRIVATE_KEY` | The whole `.pem` contents. Paste with real newlines, or as one line with literal `\n` — the server converts `\n` for you. |
+| `GITHUB_WEBHOOK_SECRET` | The same webhook secret you set when registering the App. |
+
+### 3. Endpoints
+
+- `POST /github/webhook` — GitHub's webhook receiver. The HMAC SHA-256
+  signature (`x-hub-signature-256`) is verified against
+  `GITHUB_WEBHOOK_SECRET` over the raw body; bad signatures get 401. It
+  records `installation` (created / deleted / new_permissions_accepted)
+  and `installation_repositories` (added / removed) events. No `x-api-key`
+  needed here — GitHub cannot send one; the signature is the auth.
+- `GET /api/github/installations` (auth: `x-api-key`) — recorded
+  installations + recent webhook events. An empty list means "no events
+  seen yet", not "nothing is installed" (see limits below).
+- `POST /api/github/installation-token` (auth: `x-api-key`) — body
+  `{"installationId": 12345678}` → `{"ok":true,"token":"ghs_...","expiresAt":"...","installationId":12345678}`.
+  The app then calls `api.github.com` with `Authorization: Bearer <token>`
+  exactly as it would with a personal token. The token is never logged.
+
+### 4. Calling it from the Nexus app (Kotlin / OkHttp)
+
+```kotlin
+// 1. Ask the worker for a token for the installation id the user picked.
+val tokenJson = post("$workerUrl/api/github/installation-token",
+    """{"installationId": $installationId}""", workerKey)
+val token = JSONObject(tokenJson).getString("token")
+// 2. Use it against api.github.com — e.g. list the repos the App can see:
+val req = Request.Builder()
+    .url("https://api.github.com/installation/repositories")
+    .header("Authorization", "Bearer $token")
+    .header("Accept", "application/vnd.github+json")
+    .build()
+```
+
+Cache the token in the app until `expiresAt`, then request a fresh one —
+never store the App private key on the phone.
+
 ## Environment variables
 
 | Variable | Required | Default | Notes |
@@ -136,6 +205,9 @@ the service stops. Move to Render (below) if that happens.
 | `BROWSER_WORKER_KEY` | **Yes** | — | Shared secret; without it `/api/*` returns 503. |
 | `TASK_TIMEOUT_MS` | No | `60000` | Max time for one task. |
 | `MAX_QUEUE` | No | `5` | Tasks waiting while one runs. |
+| `GITHUB_APP_ID` | Only for GitHub App connect | — | App ID (number) from the GitHub App settings page. |
+| `GITHUB_APP_PRIVATE_KEY` | Only for GitHub App connect | — | PEM private key; literal `\n` separators are converted. |
+| `GITHUB_WEBHOOK_SECRET` | Only for GitHub App connect | — | Must match the secret set on the GitHub App. |
 
 ## Honest limits (free tiers)
 
@@ -155,6 +227,14 @@ the service stops. Move to Render (below) if that happens.
   should request screenshots only when it needs one.
 - **No file downloads.** The worker returns page text and screenshots only;
   downloading files to the phone is not implemented.
+- **GitHub installation state is ephemeral.** `github-installations.json`
+  lives on the server's disk; on Railway/Render free plans the disk is wiped
+  on redeploy/restart unless a volume is attached. If the list is empty
+  after a restart, reinstalling or re-adding a repo sends a fresh webhook
+  and re-records it. Installation tokens keep working regardless — they are
+  minted from the App credentials, not from the recorded state.
+- **Installation tokens expire within ~1 hour.** The app must request a
+  fresh one (cheap, one API call) instead of storing it long-term.
 
 ## Files
 
@@ -166,6 +246,8 @@ the service stops. Move to Render (below) if that happens.
 | `railway.json` | Railway: Dockerfile build, `/health` check, restart on failure. |
 | `render.yaml` | Render: Docker web service, free plan, generated API key. |
 | `.env.example` | Local-run env template (never commit a real `.env`). |
+| `.gitignore` | Keeps `.env`, `github-installations.json` and `node_modules/` out of git. |
+| `github-installations.json` | Runtime state (created on first webhook event, never committed). |
 
 ## Local check (no deploy, no browser install needed for a syntax check)
 
