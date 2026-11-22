@@ -1,0 +1,16 @@
+# Render free-tier deploy config (fallback if Railway is unavailable).
+# If this folder is deployed as its own repo, dockerfilePath below is right.
+# If it lives inside a bigger repo, point dockerfilePath at this folder and
+# set `dockerContext` to this folder instead.
+services:
+  - type: web
+    name: nexus-browser-worker
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BROWSER_WORKER_KEY
+        generateValue: true
+      - key: NODE_ENV
+        value: production

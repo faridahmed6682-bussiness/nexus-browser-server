@@ -1,0 +1,1 @@
+{"dependencies":{"express":"^4.21.2","playwright":"1.49.1"},"description":"Cloud browser worker for Nexus AI — heavy browser automation (Playwright/Chromium) the Android app cannot do on-device.","engines":{"node":">=20"},"license":"MIT","main":"server.js","name":"nexus-browser-worker","private":true,"scripts":{"start":"node server.js"},"version":"1.0.0"}
