@@ -77,6 +77,219 @@ Fetch a URL and return its readable text — the simple case:
 Errors are always `{ok:false, error:"..."}` (401 bad key, 429 queue full,
 400 bad request, 500/503 failure).
 
+## Browser upgrades — long jobs, screenshots, form fill, downloads
+
+The old `/api/browse` and `/api/read` endpoints above are unchanged (one
+task at a time, 60 s timeout). The new endpoints below run through a **job
+queue** and a **pool of browser contexts** instead — for flows that take
+longer than one request: logins, multi-step forms, file downloads, and
+pages that stop the worker with a CAPTCHA. Code: `server.js` + `lib/`.
+
+How it works:
+
+- **Job queue** (`lib/jobQueue.js`): a job runs for up to **10 minutes**;
+  the app creates it and polls for the result. At most **20 jobs** are
+  held in memory (429 when full). Jobs live only in memory — a server
+  restart loses them. A sweep every 5 minutes deletes finished jobs
+  older than 30 minutes (or 10 minutes after the app fetched them).
+  Jobs waiting on you (`paused-needs-user`) are never swept.
+- **Context pool** (`lib/contexts.js`): up to **4 browser contexts at
+  once** in the one Chromium instance. If 4 are already running, or
+  free RAM drops below **150 MB**, the request is refused with 429
+  instead of crashing the server. Contexts are always closed after use.
+- **Session cookies** (`lib/sessions.js`): cookies are **per-request
+  only**. The app sends them in the request
+  (`cookies: [{name, value, domain, path, expires}]`); the server
+  applies them to a fresh context, harvests the updated cookies, and
+  returns them in the response. Cookies are **never stored on the
+  server disk and never logged**. On the phone they are stored
+  encrypted (Android Keystore AES/GCM) — see the app's
+  `BrowserTakeover.kt`.
+- **Stealth** (`lib/stealth.js`): every page gets a desktop-Chrome
+  fingerprint (Chrome 120 on Windows 10, `Asia/Dhaka` timezone,
+  `navigator.webdriver` hidden) and human-like typing. This helps with
+  ordinary bot checks; it does not beat dedicated anti-bot systems
+  (see Honest limits below).
+- **CAPTCHA pause**: after navigation the worker sniffs the page title
+  and visible text for challenge words (`captcha`, `verify you are
+  human`, `just a moment`, …). On a match the job pauses
+  (`paused-needs-user`) with a `takeoverUrl` and a BN+EN reason,
+  instead of failing. The app opens that URL in its own WebView for
+  you to solve, then resumes the job with the fresh cookies.
+
+No new env vars: the pool (4 contexts, 150 MB floor) and job limits
+(10 min, 20 jobs) are fixed in `lib/contexts.js` / `lib/jobQueue.js`.
+
+### `POST /api/job` (auth) — also `POST /api/jobs`
+
+Create a long job. Returns **202** `{"jobId": "..."}`. The app polls
+`GET /api/job/:id` for the result.
+
+```json
+{
+  "type": "browse",
+  "url": "https://example.com/page",
+  "cookies": [{"name": "session", "value": "YOUR_COOKIE_VALUE", "domain": "example.com"}]
+}
+```
+
+`type` is one of `browse`, `read`, `screenshot`, `fill`, `download`:
+
+- `browse` / `read` — open the URL, return visible text (max 20000
+  chars) + title + final URL.
+- `screenshot` — same page, plus a small cropped JPEG (see
+  `/api/screenshot`).
+- `fill` — fill a form; needs `fields` (array) — see `/api/fill`.
+- `download` — capture the file the page downloads (max 8 MB); see
+  Downloads below.
+
+Optional fields: `selector` / `clip` (screenshot), `fields`,
+`submit`, `allowPassword`, `checkoutApproved` (fill), `cookies` (all
+types). Errors: 400 unknown type / bad URL / `fields` not an array;
+429 too many jobs.
+
+### `GET /api/job/:id` (auth) — also `GET /api/jobs/:id`
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "type": "browse",
+  "status": "done",
+  "progress": 100,
+  "steps": [{"t": "2026-11-23T00:00:00.000Z", "text": "পাঠ্য পড়া হচ্ছে · Reading text…"}],
+  "result": {"text": "...", "truncated": false, "title": "...", "url": "https://example.com/page", "cookies": []},
+  "error": null,
+  "createdAt": "...", "updatedAt": "...", "fetchedAt": "..."
+}
+```
+
+`status`: `queued`, `running`, `done`, `failed`, `paused-needs-user`.
+`result` depends on the type: `browse`/`read` →
+`{text, truncated, title, url, cookies}`; `screenshot` →
+`{jpegBase64, width, height, bytes, cookies}`; `fill` →
+`{filledCount, notFound, url, cookies}`; `download` →
+`{base64, filename, mime, size, cookies}` (or
+`{tooLarge: true, size, filename}`, or `{notAFile: true, url}`). A
+paused job's `result` is `{takeoverUrl, reason}`. 404 when the id is
+unknown. Fetching a job marks it fetched (it is then swept 10 minutes
+later).
+
+`GET /api/jobs` (auth) lists all jobs as short summaries (no params,
+no result payload).
+
+### `POST /api/job/:id/resume` (auth)
+
+Resume a paused job after the user solved the challenge in-app. Body:
+
+```json
+{"cookies": [{"name": "session", "value": "YOUR_COOKIE_VALUE", "domain": "example.com"}]}
+```
+
+Only a `paused-needs-user` job can be resumed (400 otherwise; 404 for
+an unknown id). The job re-runs with its original params plus the
+fresh cookies. Returns `{"ok": true, "status": "queued"}`.
+
+### `POST /api/screenshot` (auth)
+
+Synchronous (60 s timeout) small screenshot — no job needed:
+
+```json
+{"url": "https://example.com/page", "selector": ".price"}
+```
+
+Response:
+
+```json
+{"ok": true, "url": "https://example.com/page", "title": "...", "jpegBase64": "...", "width": 480, "height": 120, "bytes": 12345, "cookies": []}
+```
+
+Screenshots are small by design (`lib/screenshot.js`): cropped to the
+requested element or region (never the full page), JPEG quality 50
+(never above 60), at most 480 px wide; a full-viewport shot is capped
+at 800×600 first. There is no downscaling library — an over-wide clip
+is narrowed, not resized. 429 when the context pool is full / memory
+is low; 504 after 60 s.
+
+### `POST /api/fill` (auth)
+
+Synchronous (60 s timeout) form fill:
+
+```json
+{
+  "url": "https://example.com/form",
+  "fields": [
+    {"selector": "#name", "value": "Farid"},
+    {"label": "Email", "value": "user@example.com"}
+  ],
+  "submit": false
+}
+```
+
+Each field is located by selector, label text, name attribute, or
+placeholder — in that order. Response:
+`{"ok": true, "filledCount": 2, "notFound": [], "url": "https://example.com/form", "cookies": []}`.
+
+Safety rules (`lib/formfill.js`) — these are not optional:
+
+- **Password fields** are refused unless the field declares itself a
+  password AND the request passes `allowPassword: true`.
+- **Payment is never automatic.** If `submit` is true and the page
+  contains a payment/card field, the submit is refused unless the
+  request passes `checkoutApproved: true` — and even then the worker
+  only fills and presses Enter; it **never clicks a button whose
+  label means "pay"** (`pay`, `checkout`, `place order`, …). Checkout
+  approval comes from the user in the app, never from the server.
+
+### Downloads (job type `download`)
+
+```json
+{"type": "download", "url": "https://example.com/files/report.pdf"}
+```
+
+The worker navigates to the URL and captures the download: success
+returns `{base64, filename, mime, size}` in the job result, so the app
+can upload it to Firebase Storage and hand the user a share link;
+files over **8 MB** return `{tooLarge: true, size, filename}`; a plain
+page with no download in 20 s returns `{notAFile: true, url}`. The
+temp file is always deleted on the server, whether the capture
+succeeds or fails — the server never keeps the file.
+
+### Keep-alive
+
+Free hosts sleep or stop when idle, so a **free cron-job.org job**
+pings `GET /health` **every 5 minutes** to keep the worker warm — no
+auth needed for `/health`. Setup and how to check/stop it:
+`docs/KEEP_ALIVE.md`.
+
+**Honest cost note: keep-alive is not free.** A server that never
+sleeps runs continuously, and Railway's ~$5 trial credit runs out
+much faster that way. When the credit is gone the service stops until
+you upgrade or move it (e.g. Render free tier). Turn the pinger off
+when you are not using Nexus browsing for a while — see
+`docs/KEEP_ALIVE.md` ("How to stop it"). Occasional use = no pinger
+(first request then takes ~1 min to wake the server); regular use =
+pinger on.
+
+### Honest limits (browser upgrades)
+
+- **Cloudflare Turnstile and bank sites may still block automation.**
+  Challenge detection is a keyword sniff on the page title and
+  visible text — a Turnstile widget often shows no such words, so the
+  job may fail instead of pausing. There is **no paid CAPTCHA
+  solver** anywhere: when a challenge is detected the job pauses and
+  the page is handed to you in-app; Nexus never solves a CAPTCHA for
+  you.
+- **One Chromium, 512 MB**: at most 4 contexts at once — a 5th
+  simultaneous page is refused (429 on the synchronous endpoints; a
+  job fails with the same message). Jobs are in-memory only and are
+  lost on restart.
+- **Vision screenshots are small cropped JPEGs by design** (see
+  `/api/screenshot`) — legibility, not beauty.
+- Jobs time out after **10 minutes**; synchronous screenshot/fill
+  calls after **60 s**.
+- **No persistent login**: every request starts from the cookies the
+  phone sends; the server stores nothing between requests.
+
 ## Calling it from the Nexus app (Kotlin / OkHttp)
 
 ```kotlin
@@ -225,8 +438,9 @@ never store the App private key on the phone.
   the user's own accounts, over HTTPS, and rotate passwords if a key leaks.
 - **Screenshots are PNG base64** — a full-page shot can be large; the app
   should request screenshots only when it needs one.
-- **No file downloads.** The worker returns page text and screenshots only;
-  downloading files to the phone is not implemented.
+- **File downloads (job type `download`).** A download job returns the
+  file as base64 in the job result (max 8 MB; larger files are refused
+  with `tooLarge`). The temp file is always deleted on the server.
 - **GitHub installation state is ephemeral.** `github-installations.json`
   lives on the server's disk; on Railway/Render free plans the disk is wiped
   on redeploy/restart unless a volume is attached. If the list is empty
@@ -241,6 +455,14 @@ never store the App private key on the phone.
 | File | What it is |
 |---|---|
 | `server.js` | Express + Playwright server (all endpoints, queue, auth). |
+| `lib/jobQueue.js` | Long jobs: 10-min timeout, max 20 in memory, pause/resume, sweep. |
+| `lib/contexts.js` | Context pool: max 4 contexts, 150 MB free-RAM floor, 429 on refusal. |
+| `lib/sessions.js` | Per-request cookies: apply to a fresh context, harvest back, never stored. |
+| `lib/screenshot.js` | Small cropped JPEGs: quality 50 (max 60), max 480 px wide, 800×600 viewport cap. |
+| `lib/formfill.js` | Form fill: password guard, payment guard (never clicks a pay button). |
+| `lib/downloads.js` | File capture: base64 out, 8 MB max, temp file always deleted. |
+| `lib/stealth.js` | Desktop-Chrome fingerprint + human-like mouse/typing. |
+| `docs/KEEP_ALIVE.md` | Keep-alive with free cron-job.org (BN+EN) + honest credit note. |
 | `package.json` | `express` + `playwright` (pinned 1.49.1, matching the image). |
 | `Dockerfile` | Official Playwright image (`v1.49.1-jammy`), runs as `pwuser`. |
 | `railway.json` | Railway: Dockerfile build, `/health` check, restart on failure. |
