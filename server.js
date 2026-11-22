@@ -37,6 +37,13 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
+const { JobQueue, TOO_MANY_JOBS_BN_EN } = require('./lib/jobQueue');
+const { ContextPool } = require('./lib/contexts');
+const { applyCookies, harvestCookies } = require('./lib/sessions');
+const { applyStealth, DESKTOP_USER_AGENT, VIEWPORT, LOCALE, TIMEZONE_ID } = require('./lib/stealth');
+const { takeSmallScreenshot } = require('./lib/screenshot');
+const { captureDownload } = require('./lib/downloads');
+const { fillForm } = require('./lib/formfill');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || '60000', 10);
@@ -83,7 +90,7 @@ async function getBrowser() {
     }).then((b) => {
       browser = b;
       browserLaunching = null;
-      b.on('disconnected', () => { browser = null; });
+      b.on('disconnected', () => { browser = null; pool = null; });
       return b;
     }).catch((err) => {
       browserLaunching = null;
@@ -96,6 +103,7 @@ async function getBrowser() {
 async function closeBrowser() {
   const b = browser;
   browser = null;
+  pool = null;
   if (b) await b.close().catch(() => {});
 }
 
@@ -123,6 +131,188 @@ function withTimeout(promise, ms) {
     timer = setTimeout(() => reject(new Error('task timed out after ' + ms + 'ms')), ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ---------------------------------------------------------------------------
+// Job queue + pooled contexts (new /api/job, /api/screenshot, /api/fill).
+// The old /api/browse and /api/read endpoints keep their own one-at-a-time
+// runExclusive() queue and are untouched. Cookies, keys, field values and
+// request bodies are never logged anywhere in this section.
+// ---------------------------------------------------------------------------
+const jobs = new JobQueue();
+let pool = null;
+
+// Lazily build the pool against the shared Chromium instance (created on
+// first new-endpoint use). Reset to null on browser disconnect / shutdown
+// (see getBrowser / closeBrowser) so a fresh pool is built next time.
+async function getPool() {
+  const b = await getBrowser();
+  if (!pool) pool = new ContextPool(b, {
+    maxContexts: 4,
+    minFreeMemMB: 150,
+    // Stealth desktop fingerprint at context level, so pooled contexts
+    // carry the same UA/locale/timezone as one-off contexts (see
+    // lib/stealth.js). applyStealth(page) still covers viewport +
+    // init script on every page.
+    newContextOptions: {
+      userAgent: DESKTOP_USER_AGENT,
+      locale: LOCALE,
+      timezoneId: TIMEZONE_ID,
+      viewport: { ...VIEWPORT },
+    },
+  });
+  return pool;
+}
+
+const JOB_TYPES = new Set(['browse', 'read', 'screenshot', 'fill', 'download']);
+const INVALID_URL_BN_EN = 'সঠিক URL দিন — http:// বা https:// দিয়ে শুরু হতে হবে · Invalid URL — must start with http:// or https://';
+const INVALID_JOB_TYPE_BN_EN = 'অজানা কাজের ধরন — browse, read, screenshot, fill বা download হতে হবে · Unknown job type — must be browse, read, screenshot, fill, or download';
+const JOB_NOT_FOUND_BN_EN = 'কাজটি পাওয়া যায়নি · Job not found';
+const JOB_NOT_PAUSED_BN_EN = 'এই কাজটি থেমে নেই — শুধু থেমে থাকা কাজ আবার শুরু করা যায় · Job is not paused — only a paused-needs-user job can be resumed';
+const CAPTCHA_PAUSE_BN_EN = 'ক্যাপচা যাচাই দরকার — আপনার ব্রাউজারে যাচাইটি সম্পূর্ণ করুন · CAPTCHA verification needed — please complete it in your browser';
+const SYNC_TIMEOUT_BN_EN = 'সময় শেষ — ৬০ সেকেন্ড পেরিয়ে গেছে · Timed out after 60 seconds';
+const INVALID_FIELDS_BN_EN = 'fields একটি অ্যারে হতে হবে · fields must be an array';
+
+function isHttpUrl(u) {
+  if (typeof u !== 'string' || !u) return false;
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch (_) {
+    return false;
+  }
+}
+
+// Cheap CAPTCHA / bot-challenge sniff: page title + a short slice of the
+// visible body text. Runs after navigation, before any result is stored.
+const CHALLENGE_TITLE_RE = /captcha|verify you are human|are you a robot|just a moment|attention required|checking your browser/i;
+const CHALLENGE_BODY_RE = /captcha|verify you are human|are you a robot/i;
+
+async function isChallengePage(page) {
+  try {
+    const title = await page.title().catch(() => '');
+    if (title && CHALLENGE_TITLE_RE.test(title)) return true;
+  } catch (_) { /* ignore */ }
+  try {
+    const snippet = await page.evaluate(
+      () => (document.body ? (document.body.innerText || '') : '').slice(0, 3000),
+    ).catch(() => '');
+    if (snippet && CHALLENGE_BODY_RE.test(snippet)) return true;
+  } catch (_) { /* ignore */ }
+  return false;
+}
+
+// Acquire one pooled context, run fn(context), always release it.
+// A pool refusal (cap / low memory) is rethrown with status 429 and the
+// module's exact BN+EN message so routes can answer 429 verbatim.
+async function runPooled(fn) {
+  const p = await getPool();
+  let context;
+  try {
+    context = await p.acquire();
+  } catch (err) {
+    const e = new Error(err.message);
+    e.status = 429;
+    throw e;
+  }
+  try {
+    return await fn(context);
+  } finally {
+    await p.release(context);
+  }
+}
+
+// One job's browser work, inside a pooled context. Calls jobs.pauseJob()
+// (and stops, returning null) when a CAPTCHA / challenge page is found;
+// runJob() keeps the paused status instead of marking the job done/failed.
+async function executeJobTask(job, update) {
+  const p = job.params || {};
+  const pPool = await getPool();
+  let context;
+  try {
+    context = await pPool.acquire();
+    await applyCookies(context, p.cookies);
+    const page = await context.newPage();
+    await applyStealth(page);
+
+    if (p.type === 'download') {
+      update('ডাউনলোড হচ্ছে · Downloading…', 20);
+      const dl = await captureDownload(page, p.url, {});
+      if (dl && dl.notAFile && (await isChallengePage(page))) {
+        jobs.pauseJob(job.id, CAPTCHA_PAUSE_BN_EN, p.url);
+        return null;
+      }
+      const cookies = await harvestCookies(context).catch(() => []);
+      return { ...dl, cookies };
+    }
+
+    update('পৃষ্ঠা খোলা হচ্ছে · Opening page…', 10);
+    await page.goto(p.url, { waitUntil: 'domcontentloaded', timeout: STEP_TIMEOUT_DEFAULT });
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+
+    if (await isChallengePage(page)) {
+      jobs.pauseJob(job.id, CAPTCHA_PAUSE_BN_EN, p.url);
+      return null;
+    }
+
+    let result;
+    if (p.type === 'screenshot') {
+      update('স্ক্রিনশট নেওয়া হচ্ছে · Taking screenshot…', 60);
+      result = await takeSmallScreenshot(page, { selector: p.selector, clip: p.clip });
+    } else if (p.type === 'fill') {
+      update('ফর্ম পূরণ করা হচ্ছে · Filling form…', 60);
+      result = await fillForm(page, Array.isArray(p.fields) ? p.fields : [], {
+        submit: Boolean(p.submit),
+        allowPassword: Boolean(p.allowPassword),
+        checkoutApproved: Boolean(p.checkoutApproved),
+      });
+    } else {
+      // browse / read — same text-extraction path, inside a pooled context.
+      update('পাঠ্য পড়া হচ্ছে · Reading text…', 60);
+      const text = await readVisibleText(page);
+      const clipped = truncate(text);
+      result = {
+        text: clipped.text,
+        truncated: clipped.truncated,
+        title: await page.title().catch(() => ''),
+        url: page.url(),
+      };
+    }
+    const cookies = await harvestCookies(context).catch(() => []);
+    return { ...result, cookies };
+  } finally {
+    await pPool.release(context);
+  }
+}
+
+// Sync (single-request) runners for POST /api/screenshot and /api/fill.
+async function runPooledScreenshot(url, opts) {
+  return runPooled(async (context) => {
+    await applyCookies(context, opts.cookies);
+    const page = await context.newPage();
+    await applyStealth(page);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: STEP_TIMEOUT_DEFAULT });
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    const shot = await takeSmallScreenshot(page, { selector: opts.selector, clip: opts.clip });
+    const cookies = await harvestCookies(context);
+    return { ok: true, url: page.url(), title: await page.title().catch(() => ''), ...shot, cookies };
+  });
+}
+
+async function runPooledFill(url, opts) {
+  return runPooled(async (context) => {
+    await applyCookies(context, opts.cookies);
+    const page = await context.newPage();
+    await applyStealth(page);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: STEP_TIMEOUT_DEFAULT });
+    const r = await fillForm(page, opts.fields, {
+      submit: Boolean(opts.submit),
+      allowPassword: Boolean(opts.allowPassword),
+      checkoutApproved: Boolean(opts.checkoutApproved),
+    });
+    const cookies = await harvestCookies(context);
+    return { ok: true, ...r, cookies };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +584,124 @@ app.post('/api/read', requireAuth, async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(err.status || 500).json({ ok: false, error: String((err && err.message) || err) });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Job queue + pooled-context endpoints (new; old endpoints above untouched).
+// Error responses here are JSON { error: "<BN+EN string>" }.
+// ---------------------------------------------------------------------------
+
+function createJob(req, res) {
+  const body = req.body || {};
+  const { type, url } = body;
+  if (!JOB_TYPES.has(type)) {
+    return res.status(400).json({ error: INVALID_JOB_TYPE_BN_EN });
+  }
+  if (!isHttpUrl(url)) {
+    return res.status(400).json({ error: INVALID_URL_BN_EN });
+  }
+  if (type === 'fill' && !Array.isArray(body.fields)) {
+    return res.status(400).json({ error: INVALID_FIELDS_BN_EN });
+  }
+  const jobId = jobs.createJob(type, {
+    type,
+    url,
+    selector: body.selector,
+    clip: body.clip,
+    fields: body.fields,
+    submit: body.submit,
+    allowPassword: body.allowPassword,
+    checkoutApproved: body.checkoutApproved,
+    cookies: body.cookies,
+  });
+  if (!jobId) {
+    return res.status(429).json({ error: TOO_MANY_JOBS_BN_EN });
+  }
+  const job = jobs.getJob(jobId);
+  // Fire and forget: the app polls GET /api/job/:id for the result.
+  jobs.runJob(job, (j, update) => executeJobTask(j, update)).catch(() => {});
+  return res.status(202).json({ jobId });
+}
+
+app.post('/api/job', requireAuth, createJob);
+app.post('/api/jobs', requireAuth, createJob);
+
+function getJob(req, res) {
+  const job = jobs.publicJob(req.params.id);
+  if (!job) return res.status(404).json({ error: JOB_NOT_FOUND_BN_EN });
+  delete job._runId; // internal run guard — not part of the public view
+  jobs.markFetched(req.params.id);
+  return res.json(job);
+}
+
+app.get('/api/job/:id', requireAuth, getJob);
+app.get('/api/jobs/:id', requireAuth, getJob);
+
+app.get('/api/jobs', requireAuth, (req, res) => {
+  res.json({ ok: true, jobs: jobs.listJobs() });
+});
+
+function resumeJob(req, res) {
+  const job = jobs.getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: JOB_NOT_FOUND_BN_EN });
+  const resumed = jobs.resumeJob(req.params.id);
+  if (!resumed) return res.status(400).json({ error: JOB_NOT_PAUSED_BN_EN });
+  const freshCookies = (req.body || {}).cookies;
+  if (Array.isArray(freshCookies)) resumed.params.cookies = freshCookies;
+  jobs.runJob(resumed, (j, update) => executeJobTask(j, update)).catch(() => {});
+  return res.json({ ok: true, status: resumed.status });
+}
+
+app.post('/api/job/:id/resume', requireAuth, resumeJob);
+app.post('/api/jobs/:id/resume', requireAuth, resumeJob);
+
+app.post('/api/screenshot', requireAuth, async (req, res) => {
+  const { url, selector, clip, cookies } = req.body || {};
+  if (!isHttpUrl(url)) {
+    return res.status(400).json({ error: INVALID_URL_BN_EN });
+  }
+  try {
+    const result = await withTimeout(
+      runPooledScreenshot(url, { selector, clip, cookies }),
+      TASK_TIMEOUT_MS,
+    );
+    res.json(result);
+  } catch (err) {
+    if (err && err.status === 429) return res.status(429).json({ error: err.message });
+    if (err && err.message && err.message.indexOf('task timed out') === 0) {
+      return res.status(504).json({ error: SYNC_TIMEOUT_BN_EN });
+    }
+    res.status(500).json({ error: String((err && err.message) || err) });
+  }
+});
+
+app.post('/api/fill', requireAuth, async (req, res) => {
+  const body = req.body || {};
+  if (!isHttpUrl(body.url)) {
+    return res.status(400).json({ error: INVALID_URL_BN_EN });
+  }
+  if (!Array.isArray(body.fields)) {
+    return res.status(400).json({ error: INVALID_FIELDS_BN_EN });
+  }
+  try {
+    const result = await withTimeout(
+      runPooledFill(body.url, {
+        fields: body.fields,
+        submit: body.submit,
+        allowPassword: body.allowPassword,
+        checkoutApproved: body.checkoutApproved,
+        cookies: body.cookies,
+      }),
+      TASK_TIMEOUT_MS,
+    );
+    res.json(result);
+  } catch (err) {
+    if (err && err.status === 429) return res.status(429).json({ error: err.message });
+    if (err && err.message && err.message.indexOf('task timed out') === 0) {
+      return res.status(504).json({ error: SYNC_TIMEOUT_BN_EN });
+    }
+    res.status(500).json({ error: String((err && err.message) || err) });
   }
 });
 
