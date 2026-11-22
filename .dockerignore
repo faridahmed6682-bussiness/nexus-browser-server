@@ -1,0 +1,11 @@
+# Build context exclusions for the Render Docker build.
+# These files stay OUT of the build context; they are NOT deleted from the repo.
+# (Without this file Render uploads the local node_modules/ and .git/ as build
+# context, which makes the free-tier build slow and needlessly large.)
+node_modules
+.git
+.gitignore
+.env
+.env.example
+tests
+*.md

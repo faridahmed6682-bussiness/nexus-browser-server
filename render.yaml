@@ -1,16 +1,34 @@
-# Render free-tier deploy config (fallback if Railway is unavailable).
-# If this folder is deployed as its own repo, dockerfilePath below is right.
-# If it lives inside a bigger repo, point dockerfilePath at this folder and
-# set `dockerContext` to this folder instead.
+# Render free-tier deploy config — SECOND Nexus browser worker.
+# Routing rule: live tabs 1-3 go to Railway (primary); live tab 4+ goes to
+# this Render service. The app wakes Render only while Railway is full
+# (3 live tabs) or Render tabs are active, and stops pinging it when the
+# load drops (Render discourages sleep-avoidance pinging).
+#
+# Deploy routes:
+#   A) Blueprint (recommended): Render Dashboard -> New -> Blueprint,
+#      pick the nexus-browser-server repo — this file applies itself.
+#      BROWSER_WORKER_KEY is NOT in this file on purpose (sync: false):
+#      set it by hand in the dashboard to the SAME value Railway uses.
+#   B) Manual web service: New -> Web Service, Runtime Docker,
+#      Dockerfile path ./Dockerfile, plan Free, health check /health.
+# If this folder is deployed as its own repo, dockerfilePath/dockerContext
+# below are right. If it lives inside a bigger repo, point both at this
+# folder instead.
 services:
   - type: web
     name: nexus-browser-worker
     env: docker
     dockerfilePath: ./Dockerfile
+    dockerContext: .
     plan: free
     healthCheckPath: /health
     envVars:
+      # MUST match Railway's BROWSER_WORKER_KEY exactly — the Nexus app
+      # sends one key to both workers. Never use generateValue here:
+      # a generated key would not match Railway and every authed call
+      # would 401. sync: false means "managed in the dashboard, never
+      # overwritten by blueprint syncs" — paste the Railway key by hand.
       - key: BROWSER_WORKER_KEY
-        generateValue: true
+        sync: false
       - key: NODE_ENV
         value: production
