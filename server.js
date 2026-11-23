@@ -52,6 +52,14 @@ const MAX_QUEUE = parseInt(process.env.MAX_QUEUE || '5', 10);
 const API_KEY = process.env.BROWSER_WORKER_KEY || '';
 const STEP_TIMEOUT_DEFAULT = 15000;
 const MAX_TEXT_CHARS = 20000;
+// runTask contract (Android BrowserWorkerClient): POST /api/browse with
+// {"task": "...", "url": "..."}. The task is the job instruction — e.g.
+// "Open this Google Translate page and return ONLY the translated text".
+// This server has no LLM, so it cannot interpret the instruction itself;
+// it honours it by browsing the page the task names and returning the
+// page text, which the app's model then uses. A task with no url field
+// may name its page inside the task text ("Page: https://...").
+const MAX_TASK_CHARS = 4000;
 
 // GitHub App credentials — env vars only, never hardcoded or logged.
 // The private key is often stored as one line with literal \n separators
@@ -420,13 +428,14 @@ async function runSteps(page, steps) {
   return { lastText, screenshotBase64 };
 }
 
-async function runBrowse(url, steps) {
+async function runBrowse(url, steps, task) {
   const b = await getBrowser();
   const context = await b.newContext({ viewport: { width: 1280, height: 800 } });
   try {
     const page = await context.newPage();
-    if (url) {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: STEP_TIMEOUT_DEFAULT });
+    const targetUrl = url || extractUrlFromTask(task);
+    if (targetUrl) {
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: STEP_TIMEOUT_DEFAULT });
     }
     const { lastText, screenshotBase64 } = await runSteps(page, steps);
     const text = lastText !== null ? lastText : await readVisibleText(page);
@@ -437,12 +446,23 @@ async function runBrowse(url, steps) {
       title: await page.title().catch(() => ''),
       text: clipped.text,
       truncated: clipped.truncated,
+      result: clipped.text,
     };
+    if (typeof task === 'string' && task) out.task = task;
     if (screenshotBase64) out.screenshotBase64 = screenshotBase64;
     return out;
   } finally {
     await context.close().catch(() => {});
   }
+}
+
+// First http(s) URL mentioned inside a task string, or null. Lets a
+// task-only call (no url field) name its own page, e.g. translate and
+// free-chat tasks that carry "Page: https://...".
+function extractUrlFromTask(task) {
+  if (typeof task !== 'string') return null;
+  const m = task.match(/https?:\/\/[^\s"'<>]+/);
+  return m ? m[0] : null;
 }
 
 async function runRead(url) {
@@ -589,16 +609,28 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/api/browse', requireAuth, async (req, res) => {
-  const { url, steps } = req.body || {};
+  const { url, steps, task } = req.body || {};
+  if (task !== undefined && typeof task !== 'string') {
+    return res.status(400).json({ ok: false, error: 'task must be a string' });
+  }
+  if (typeof task === 'string' && task.length > MAX_TASK_CHARS) {
+    return res.status(400).json({ ok: false, error: 'task must be at most 4000 characters' });
+  }
   const hasGoto = Array.isArray(steps) && steps.some((s) => s && s.action === 'goto');
-  if (!url && !hasGoto) {
-    return res.status(400).json({ ok: false, error: 'url or a goto step is required' });
+  const taskUrl = extractUrlFromTask(task);
+  // The app's reachability check posts {"task": "ping"} with no url.
+  // Answer it without launching a browser.
+  if (typeof task === 'string' && task.trim() === 'ping' && !url && !hasGoto && !taskUrl) {
+    return res.json({ ok: true, task: 'ping', result: 'pong', text: 'pong' });
+  }
+  if (!url && !hasGoto && !taskUrl) {
+    return res.status(400).json({ ok: false, error: 'url, a goto step, or a task containing a URL is required' });
   }
   if (steps !== undefined && !Array.isArray(steps)) {
     return res.status(400).json({ ok: false, error: 'steps must be an array' });
   }
   try {
-    const result = await runExclusive(() => withTimeout(runBrowse(url, steps), TASK_TIMEOUT_MS));
+    const result = await runExclusive(() => withTimeout(runBrowse(url, steps, task), TASK_TIMEOUT_MS));
     res.json(result);
   } catch (err) {
     res.status(err.status || 500).json({ ok: false, error: String((err && err.message) || err) });
