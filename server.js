@@ -44,6 +44,7 @@ const { applyStealth, DESKTOP_USER_AGENT, VIEWPORT, LOCALE, TIMEZONE_ID } = requ
 const { takeSmallScreenshot } = require('./lib/screenshot');
 const { captureDownload } = require('./lib/downloads');
 const { fillForm } = require('./lib/formfill');
+const { sendPush, maskToken } = require('./lib/push');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || '60000', 10);
@@ -139,7 +140,37 @@ function withTimeout(promise, ms) {
 // runExclusive() queue and are untouched. Cookies, keys, field values and
 // request bodies are never logged anywhere in this section.
 // ---------------------------------------------------------------------------
-const jobs = new JobQueue();
+const jobs = new JobQueue({
+  // Best-effort push on job completion: when a job finishes ('done') or
+  // pauses needing the user ('paused-needs-user'), notify the app via FCM
+  // if the job carried an fcmToken. A push failure never fails the job —
+  // lib/jobQueue swallows callback errors, and this handler itself also
+  // catches everything. No Firestore lookup here (follow-up): the token
+  // must come in the job request body for now (see docs/PUSH_NOTIFICATIONS.md).
+  onJobEvent: async (event, job) => {
+    const token = job && job.params && typeof job.params.fcmToken === 'string'
+      ? job.params.fcmToken
+      : '';
+    if (!token) return; // no device token known — nothing to notify
+    const isPaused = event === 'paused-needs-user';
+    const title = isPaused
+      ? 'Nexus: আপনার সাহায্য দরকার · Needs you'
+      : 'Nexus: কাজ শেষ · Job done';
+    const body = isPaused
+      ? 'কাজটি থেমে গেছে — ' + (job.result && job.result.reason ? job.result.reason : 'আপনার সাহায্য দরকার') + ' · Job ' + job.id.slice(0, 8) + ' paused and needs you.'
+      : 'কাজটি শেষ হয়েছে · Job ' + job.id.slice(0, 8) + ' (' + job.type + ') is done.';
+    try {
+      await sendPush(token, {
+        title,
+        body,
+        data: { jobId: job.id, type: job.type, event, status: job.status },
+      });
+    } catch (err) {
+      // Best-effort only: log (token masked) and move on.
+      console.warn('[push] job notify failed for ' + maskToken(token) + ': ' + (err && err.message ? err.message : err));
+    }
+  },
+});
 let pool = null;
 
 // Lazily build the pool against the shared Chromium instance (created on
@@ -543,7 +574,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'nexus-browser-worker',
-    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations'],
+    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations', 'POST /api/notify'],
   });
 });
 
@@ -614,6 +645,10 @@ function createJob(req, res) {
     allowPassword: body.allowPassword,
     checkoutApproved: body.checkoutApproved,
     cookies: body.cookies,
+    // Optional FCM device token: when the job finishes or pauses needing
+    // the user, the server sends a push to this token (lib/push.js).
+    // Stored in params only — never logged, never in publicJob() output.
+    fcmToken: typeof body.fcmToken === 'string' ? body.fcmToken : undefined,
   });
   if (!jobId) {
     return res.status(429).json({ error: TOO_MANY_JOBS_BN_EN });
@@ -649,12 +684,51 @@ function resumeJob(req, res) {
   if (!resumed) return res.status(400).json({ error: JOB_NOT_PAUSED_BN_EN });
   const freshCookies = (req.body || {}).cookies;
   if (Array.isArray(freshCookies)) resumed.params.cookies = freshCookies;
+  // A resumed job may carry a fresh FCM token (device token can rotate).
+  if (typeof (req.body || {}).fcmToken === 'string') resumed.params.fcmToken = req.body.fcmToken;
   jobs.runJob(resumed, (j, update) => executeJobTask(j, update)).catch(() => {});
   return res.json({ ok: true, status: resumed.status });
 }
 
 app.post('/api/job/:id/resume', requireAuth, resumeJob);
 app.post('/api/jobs/:id/resume', requireAuth, resumeJob);
+
+// ---------------------------------------------------------------------------
+// Push notifications (FCM via Firebase Admin SDK — lib/push.js).
+// POST /api/notify { token, title, body, data? } -> { ok: true, messageId }
+// Auth: same requireAuth (x-api-key) as every other /api/* endpoint.
+// Returns 503 when push is not configured (no FIREBASE_SERVICE_ACCOUNT_JSON),
+// 400 on invalid input. The token is never logged in full (masked only).
+// ---------------------------------------------------------------------------
+const MAX_NOTIFY_TITLE = 200;
+const MAX_NOTIFY_BODY = 1000;
+
+app.post('/api/notify', requireAuth, async (req, res) => {
+  const body = req.body || {};
+  const { token, title, body: text, data } = body;
+  if (!token || typeof token !== 'string' || token.length < 10 || token.length > 4096) {
+    return res.status(400).json({ ok: false, error: 'token is required (string, 10–4096 chars)' });
+  }
+  if (!title || typeof title !== 'string' || title.length > MAX_NOTIFY_TITLE) {
+    return res.status(400).json({ ok: false, error: 'title is required (string, max ' + MAX_NOTIFY_TITLE + ' chars)' });
+  }
+  if (!text || typeof text !== 'string' || text.length > MAX_NOTIFY_BODY) {
+    return res.status(400).json({ ok: false, error: 'body is required (string, max ' + MAX_NOTIFY_BODY + ' chars)' });
+  }
+  if (data !== undefined && (typeof data !== 'object' || data === null || Array.isArray(data))) {
+    return res.status(400).json({ ok: false, error: 'data must be an object of string values' });
+  }
+  try {
+    const messageId = await sendPush(token, { title, body: text, data });
+    return res.json({ ok: true, messageId });
+  } catch (err) {
+    if (err && err.code === 'PUSH_NOT_CONFIGURED') {
+      return res.status(503).json({ ok: false, error: err.message });
+    }
+    console.warn('[push] /api/notify failed for ' + maskToken(token) + ': ' + (err && err.message ? err.message : err));
+    return res.status(502).json({ ok: false, error: 'failed to send push: ' + (err && err.message ? err.message : String(err)) });
+  }
+});
 
 app.post('/api/screenshot', requireAuth, async (req, res) => {
   const { url, selector, clip, cookies } = req.body || {};
