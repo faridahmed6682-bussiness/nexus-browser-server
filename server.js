@@ -45,6 +45,7 @@ const { takeSmallScreenshot } = require('./lib/screenshot');
 const { captureDownload } = require('./lib/downloads');
 const { fillForm } = require('./lib/formfill');
 const { sendPush, maskToken } = require('./lib/push');
+const { runAiStudioBuild, isAgentLlmConfigured, agentLlmStatus } = require('./lib/aistudio-agent');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || '60000', 10);
@@ -203,7 +204,7 @@ async function getPool() {
   return pool;
 }
 
-const JOB_TYPES = new Set(['browse', 'read', 'screenshot', 'fill', 'download']);
+const JOB_TYPES = new Set(['browse', 'read', 'screenshot', 'fill', 'download', 'aistudio-build']);
 const INVALID_URL_BN_EN = 'সঠিক URL দিন — http:// বা https:// দিয়ে শুরু হতে হবে · Invalid URL — must start with http:// or https://';
 const INVALID_JOB_TYPE_BN_EN = 'অজানা কাজের ধরন — browse, read, screenshot, fill বা download হতে হবে · Unknown job type — must be browse, read, screenshot, fill, or download';
 const JOB_NOT_FOUND_BN_EN = 'কাজটি পাওয়া যায়নি · Job not found';
@@ -211,6 +212,11 @@ const JOB_NOT_PAUSED_BN_EN = 'এই কাজটি থেমে নেই — 
 const CAPTCHA_PAUSE_BN_EN = 'ক্যাপচা যাচাই দরকার — আপনার ব্রাউজারে যাচাইটি সম্পূর্ণ করুন · CAPTCHA verification needed — please complete it in your browser';
 const SYNC_TIMEOUT_BN_EN = 'সময় শেষ — ৬০ সেকেন্ড পেরিয়ে গেছে · Timed out after 60 seconds';
 const INVALID_FIELDS_BN_EN = 'fields একটি অ্যারে হতে হবে · fields must be an array';
+const INVALID_PROMPT_BN_EN = 'প্রম্পট দরকার — খালি নয়, সর্বোচ্চ ৮০০০ অক্ষর · prompt is required — non-empty string, max 8000 characters';
+const INVALID_COOKIES_BN_EN = 'cookies একটি অ্যারে হতে হবে · cookies must be an array';
+const INVALID_MAX_MINUTES_BN_EN = 'maxMinutes একটি সংখ্যা হতে হবে · maxMinutes must be a number';
+const INVALID_FCM_TOKEN_BN_EN = 'fcmToken একটি স্ট্রিং হতে হবে · fcmToken must be a string';
+const JOB_ALREADY_TERMINAL_BN_EN = 'কাজটি ইতিমধ্যে শেষ হয়ে গেছে — বাতিল করা যাবে না · Job is already finished — it cannot be cancelled';
 
 function isHttpUrl(u) {
   if (typeof u !== 'string' || !u) return false;
@@ -428,10 +434,15 @@ async function runSteps(page, steps) {
   return { lastText, screenshotBase64 };
 }
 
-async function runBrowse(url, steps, task) {
+async function runBrowse(url, steps, task, cookies) {
   const b = await getBrowser();
   const context = await b.newContext({ viewport: { width: 1280, height: 800 } });
   try {
+    // Shared Google login: the phone stores the Google session cookies
+    // encrypted and sends them per request; the server keeps nothing
+    // after the context closes (see lib/sessions.js). Cookies need a
+    // domain — applyCookies silently skips domain-less entries.
+    await applyCookies(context, cookies);
     const page = await context.newPage();
     const targetUrl = url || extractUrlFromTask(task);
     if (targetUrl) {
@@ -450,6 +461,9 @@ async function runBrowse(url, steps, task) {
     };
     if (typeof task === 'string' && task) out.task = task;
     if (screenshotBase64) out.screenshotBase64 = screenshotBase64;
+    // Return the refreshed session cookies so the phone can store them
+    // back (same shape as the /api/job result).
+    out.cookies = await harvestCookies(context).catch(() => []);
     return out;
   } finally {
     await context.close().catch(() => {});
@@ -594,7 +608,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'nexus-browser-worker',
-    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations', 'POST /api/notify'],
+    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/job/:id/cancel', 'POST /api/agent/build', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations', 'POST /api/notify'],
   });
 });
 
@@ -609,7 +623,7 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/api/browse', requireAuth, async (req, res) => {
-  const { url, steps, task } = req.body || {};
+  const { url, steps, task, cookies } = req.body || {};
   if (task !== undefined && typeof task !== 'string') {
     return res.status(400).json({ ok: false, error: 'task must be a string' });
   }
@@ -629,8 +643,11 @@ app.post('/api/browse', requireAuth, async (req, res) => {
   if (steps !== undefined && !Array.isArray(steps)) {
     return res.status(400).json({ ok: false, error: 'steps must be an array' });
   }
+  if (cookies !== undefined && !Array.isArray(cookies)) {
+    return res.status(400).json({ ok: false, error: 'cookies must be an array' });
+  }
   try {
-    const result = await runExclusive(() => withTimeout(runBrowse(url, steps, task), TASK_TIMEOUT_MS));
+    const result = await runExclusive(() => withTimeout(runBrowse(url, steps, task, cookies), TASK_TIMEOUT_MS));
     res.json(result);
   } catch (err) {
     res.status(err.status || 500).json({ ok: false, error: String((err && err.message) || err) });
@@ -698,6 +715,7 @@ function getJob(req, res) {
   const job = jobs.publicJob(req.params.id);
   if (!job) return res.status(404).json({ error: JOB_NOT_FOUND_BN_EN });
   delete job._runId; // internal run guard — not part of the public view
+  delete job._cancelled; // internal cancel flag — not part of the public view
   jobs.markFetched(req.params.id);
   return res.json(job);
 }
@@ -724,6 +742,86 @@ function resumeJob(req, res) {
 
 app.post('/api/job/:id/resume', requireAuth, resumeJob);
 app.post('/api/jobs/:id/resume', requireAuth, resumeJob);
+
+// ---------------------------------------------------------------------------
+// AI Studio build agent (server-side, lib/aistudio-agent.js).
+// POST /api/agent/build creates a long 'aistudio-build' job that drives an
+// AI Studio build end-to-end (open page, paste prompt, click Build, wait,
+// fix errors, return the result). The agent runs on its OWN dedicated LLM
+// keys (BROWSER_AGENT_GEMINI_KEY, BROWSER_AGENT_OPENROUTER_KEY) — never
+// the chat agents' keys and never Groq — so one agent's quota running out
+// never stops the others. No 503 here when that key is unconfigured: the
+// job itself finishes fast with status 'not-configured', so the app (and
+// the dry-run check) sees a clear job record instead of a bare error.
+// ---------------------------------------------------------------------------
+const AGENT_BUILD_DEFAULT_URL = 'https://aistudio.google.com/';
+const AGENT_BUILD_MAX_PROMPT_CHARS = 8000;
+
+function createAgentBuild(req, res) {
+  const body = req.body || {};
+  const { prompt, url, cookies, maxMinutes, fcmToken } = body;
+  if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > AGENT_BUILD_MAX_PROMPT_CHARS) {
+    return res.status(400).json({ error: INVALID_PROMPT_BN_EN });
+  }
+  const targetUrl = url === undefined ? AGENT_BUILD_DEFAULT_URL : url;
+  if (!isHttpUrl(targetUrl)) {
+    return res.status(400).json({ error: INVALID_URL_BN_EN });
+  }
+  if (cookies !== undefined && !Array.isArray(cookies)) {
+    return res.status(400).json({ error: INVALID_COOKIES_BN_EN });
+  }
+  if (maxMinutes !== undefined && (typeof maxMinutes !== 'number' || Number.isNaN(maxMinutes))) {
+    return res.status(400).json({ error: INVALID_MAX_MINUTES_BN_EN });
+  }
+  if (fcmToken !== undefined && typeof fcmToken !== 'string') {
+    return res.status(400).json({ error: INVALID_FCM_TOKEN_BN_EN });
+  }
+  const minutes = maxMinutes === undefined
+    ? 10
+    : Math.max(1, Math.min(20, Math.floor(maxMinutes)));
+  const jobId = jobs.createJob('aistudio-build', {
+    type: 'aistudio-build',
+    prompt,
+    url: targetUrl,
+    cookies,
+    maxMinutes: minutes,
+    fcmToken: typeof fcmToken === 'string' ? fcmToken : undefined,
+    // Per-job timeout: the build window plus 2 minutes of agent overhead.
+    timeoutMs: minutes * 60 * 1000 + 120000,
+  });
+  if (!jobId) {
+    return res.status(429).json({ error: TOO_MANY_JOBS_BN_EN });
+  }
+  const job = jobs.getJob(jobId);
+  // Fire and forget: the app polls GET /api/job/:id for the result.
+  jobs.runJob(job, (j, update) => runAiStudioBuild(j, update, {
+    getPool,
+    applyCookies,
+    harvestCookies,
+    applyStealth,
+    takeSmallScreenshot,
+    isChallengePage,
+  })).catch(() => {});
+  return res.status(202).json({ jobId });
+}
+
+app.post('/api/agent/build', requireAuth, createAgentBuild);
+
+// STOP: cancel a running/queued/paused job. The agent checks
+// job._cancelled between steps and stops; runJob() keeps the 'cancelled'
+// status instead of marking the job done/failed. No push on cancel.
+function cancelJobRoute(req, res) {
+  const job = jobs.getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: JOB_NOT_FOUND_BN_EN });
+  if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
+    return res.status(400).json({ error: JOB_ALREADY_TERMINAL_BN_EN });
+  }
+  jobs.cancelJob(req.params.id);
+  return res.json({ ok: true, status: 'cancelled' });
+}
+
+app.post('/api/job/:id/cancel', requireAuth, cancelJobRoute);
+app.post('/api/jobs/:id/cancel', requireAuth, cancelJobRoute);
 
 // ---------------------------------------------------------------------------
 // Push notifications (FCM via Firebase Admin SDK — lib/push.js).
@@ -935,6 +1033,9 @@ app.use((err, req, res, next) => {
 // ---------------------------------------------------------------------------
 const server = app.listen(PORT, () => {
   console.log('nexus-browser-worker listening on port ' + PORT);
+  // Agent LLM status only (configured/provider/model/chain booleans) —
+  // agentLlmStatus() returns NO key, so this log is safe.
+  console.log('[agent] browser agent LLM:', JSON.stringify(agentLlmStatus()));
   if (!API_KEY) console.warn('WARNING: BROWSER_WORKER_KEY is not set — /api/* will return 503 until it is set.');
 });
 

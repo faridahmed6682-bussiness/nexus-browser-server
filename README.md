@@ -290,6 +290,117 @@ pinger on.
 - **No persistent login**: every request starts from the cookies the
   phone sends; the server stores nothing between requests.
 
+## AI Studio build agent (server-side)
+
+A separate agent that drives an **AI Studio build end-to-end on the
+server** — it opens AI Studio, pastes your prompt, clicks Build, waits
+for the build, fixes errors, and returns the result (app/preview URL).
+Code: `lib/aistudio-agent.js` (the build-driving agent) + `server.js`
+(the wiring: route, job, STOP). The old `/api/browse` path cannot do
+this — it only opens a page and returns text; the agent is what
+actually performs the build steps.
+
+**Decided spec (2026-11-23).** Provider: **Google AI Studio (Gemini)**.
+Primary model: **gemini-3.6-flash** — full flash, vision-capable, in the
+verified free chain (distinct from the chat default
+gemini-3.1-flash-lite).
+
+**Dedicated key slots.** The agent runs on its **own** dedicated keys —
+never the chat agents' keys and never Groq. Each agent keeps its own
+provider/model, so one agent's quota running out never stops the
+others. The user supplies the keys as server env vars (Railway/Render
+**Variables**), and/or via an app Settings "Browser agent" key field
+(app-side — the server just reads the env vars):
+
+| Variable | Required | Notes |
+|---|---|---|
+| `BROWSER_AGENT_GEMINI_KEY` | **Yes, for builds** | The agent's **own dedicated Gemini key**. Without it, builds finish as `not-configured`. |
+| `BROWSER_AGENT_OPENROUTER_KEY` | No | Its own dedicated key slot; enables the last failover leg only. |
+| `BROWSER_AGENT_RPM_BUDGET` | No | Per-model RPM budget for the failover rotation (default 30/min per model). |
+
+Never commit `.env` and never print a key. The server logs only the
+agent LLM status (`configured` / `provider` / `model` / `chain` /
+`openrouterConfigured`) at boot — no key value, ever.
+
+**Failover chain** — inside the agent's **own** slots only, in fixed
+order:
+
+1. `gemini-3.6-flash` — key `BROWSER_AGENT_GEMINI_KEY`
+2. `gemini-3.1-flash-lite` — same dedicated key
+3. OpenRouter `qwen/qwen3-coder:free` — key
+   `BROWSER_AGENT_OPENROUTER_KEY` (skipped when that key is unset)
+4. Stop with a clear error.
+
+**Failover rule** (same mechanics as the app's `ApiKeyFailoverManager`,
+implemented in `lib/aistudio-agent.js`): per-model health tracking +
+cooldown — on a 429 the failed model cools down and the next model is
+tried, then the next provider. Each model/provider has its own
+per-minute (RPM) budget (`BROWSER_AGENT_RPM_BUDGET`, default 30/min);
+rotate **before** hitting the limit, and always honour `Retry-After`.
+
+### `POST /api/agent/build` (auth)
+
+Create a build job. Returns **202** `{"jobId": "..."}`. The app polls
+`GET /api/job/:id` for the result (same job shape as `/api/job`).
+
+```json
+{
+  "prompt": "Build a simple to-do app with a dark theme",
+  "url": "https://aistudio.google.com/",
+  "cookies": [{"name": "SID", "value": "YOUR_COOKIE_VALUE", "domain": ".google.com"}],
+  "maxMinutes": 10,
+  "fcmToken": "optional-device-token"
+}
+```
+
+- `prompt` — **required**, non-empty string, max **8000** characters.
+- `url` — optional, defaults to `https://aistudio.google.com/`; must be
+  `http(s)` when given.
+- `cookies` — optional array of session cookies (the phone's stored
+  Google session, same shape as `/api/job`); applied to the build
+  browser context and harvested back into the job result.
+- `maxMinutes` — optional number, default **10**, clamped to **1–20**.
+  The job timeout is `maxMinutes` + 2 minutes of agent overhead.
+- `fcmToken` — optional string; the app is push-notified when the job
+  finishes or pauses needing the user (same as other job types).
+
+Errors: 400 bad input (BN+EN message); 429 too many jobs. There is
+**no 503 when the agent LLM key is unconfigured** — the job is still
+created and finishes fast with status `not-configured`, so the app
+(and the dry-run check) sees a clear job record.
+
+### Polling — `GET /api/job/:id` (auth)
+
+Same as any other job. The build result is in `result`:
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "type": "aistudio-build",
+  "status": "done",
+  "progress": 100,
+  "steps": [{"t": "...", "text": "Build started…"}],
+  "result": {"ok": true, "status": "built", "appUrl": "https://...", "previewUrl": "https://...", "cookies": []},
+  "error": null
+}
+```
+
+`result.status` is one of `built`, `failed`, `login-required`,
+`cancelled`, `timeout`, `not-configured`. `login-required` means the
+Google session cookies were missing/expired — sign in again in the
+app and retry with fresh cookies. `not-configured` means the server
+has no `BROWSER_AGENT_GEMINI_KEY` set (see the dedicated-key table
+above).
+
+### STOP — `POST /api/job/:id/cancel` (auth)
+
+Also `POST /api/jobs/:id/cancel`. Stops a queued, running, or paused
+build job and returns `{"ok": true, "status": "cancelled"}`. The agent
+checks for the cancel between steps and stops; the job stays
+`cancelled` (never marked done/failed) and no push is sent. 404 for an
+unknown id; 400 if the job is already terminal
+(`done` / `failed` / `cancelled`).
+
 ## Calling it from the Nexus app (Kotlin / OkHttp)
 
 ```kotlin
@@ -421,6 +532,9 @@ never store the App private key on the phone.
 | `GITHUB_APP_ID` | Only for GitHub App connect | — | App ID (number) from the GitHub App settings page. |
 | `GITHUB_APP_PRIVATE_KEY` | Only for GitHub App connect | — | PEM private key; literal `\n` separators are converted. |
 | `GITHUB_WEBHOOK_SECRET` | Only for GitHub App connect | — | Must match the secret set on the GitHub App. |
+| `BROWSER_AGENT_GEMINI_KEY` | Only for AI Studio builds | — | Build agent's **own dedicated Gemini key** — never a chat agent's key. |
+| `BROWSER_AGENT_OPENROUTER_KEY` | No | — | Build agent's own dedicated OpenRouter key (last failover leg). |
+| `BROWSER_AGENT_RPM_BUDGET` | No | `30` | Build agent's per-model RPM budget for failover rotation. |
 
 ## Honest limits (free tiers)
 
