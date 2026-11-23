@@ -46,6 +46,7 @@ const { captureDownload } = require('./lib/downloads');
 const { fillForm } = require('./lib/formfill');
 const { sendPush, maskToken } = require('./lib/push');
 const { runAiStudioBuild, isAgentLlmConfigured, agentLlmStatus } = require('./lib/aistudio-agent');
+const { searchWeb, searchStatus } = require('./lib/search');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || '60000', 10);
@@ -216,6 +217,7 @@ const INVALID_PROMPT_BN_EN = 'প্রম্পট দরকার — খা�
 const INVALID_COOKIES_BN_EN = 'cookies একটি অ্যারে হতে হবে · cookies must be an array';
 const INVALID_MAX_MINUTES_BN_EN = 'maxMinutes একটি সংখ্যা হতে হবে · maxMinutes must be a number';
 const INVALID_FCM_TOKEN_BN_EN = 'fcmToken একটি স্ট্রিং হতে হবে · fcmToken must be a string';
+const INVALID_SEARCH_QUERY_BN_EN = 'খোঁজার কথা দিন — খালি নয়, সর্বোচ্চ ৫০০ অক্ষর · q is required — a non-empty string, max 500 characters';
 const JOB_ALREADY_TERMINAL_BN_EN = 'কাজটি ইতিমধ্যে শেষ হয়ে গেছে — বাতিল করা যাবে না · Job is already finished — it cannot be cancelled';
 
 function isHttpUrl(u) {
@@ -608,7 +610,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'nexus-browser-worker',
-    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/job/:id/cancel', 'POST /api/agent/build', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations', 'POST /api/notify'],
+    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/search', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/job/:id/cancel', 'POST /api/agent/build', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations', 'POST /api/notify'],
   });
 });
 
@@ -664,6 +666,30 @@ app.post('/api/read', requireAuth, async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(err.status || 500).json({ ok: false, error: String((err && err.message) || err) });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Web search: Google Custom Search (free 100/day) + DuckDuckGo fallback.
+// POST /api/search {q} -> {ok, provider, results, quotaRemaining}.
+// lib/search.js tries Google first; on any Google failure, on quota
+// exhaustion, or when the CSE keys are unset, it falls back to the
+// DuckDuckGo HTML endpoint (plain HTTP, no browser). The CSE key is
+// never logged or returned — lib/search.js logs only the provider,
+// the HTTP status and the remaining quota. On total failure (both
+// providers down) this answers 502 and the app falls back to opening
+// the DuckDuckGo search URL in the browser worker (unchanged path).
+// ---------------------------------------------------------------------------
+app.post('/api/search', requireAuth, async (req, res) => {
+  const q = (req.body || {}).q;
+  if (typeof q !== 'string' || !q.trim() || q.trim().length > 500) {
+    return res.status(400).json({ ok: false, error: INVALID_SEARCH_QUERY_BN_EN });
+  }
+  try {
+    const result = await searchWeb(q.trim());
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: 'খোঁজা যায়নি — Google ও DuckDuckGo দুটোই সাড়া দেয়নি · Search failed — both Google and DuckDuckGo are unreachable' });
   }
 });
 
@@ -1036,6 +1062,9 @@ const server = app.listen(PORT, () => {
   // Agent LLM status only (configured/provider/model/chain booleans) —
   // agentLlmStatus() returns NO key, so this log is safe.
   console.log('[agent] browser agent LLM:', JSON.stringify(agentLlmStatus()));
+  // Search status only (configured/quota counts) — searchStatus()
+  // returns NO key, so this log is safe.
+  console.log('[search] web search:', JSON.stringify(searchStatus()));
   if (!API_KEY) console.warn('WARNING: BROWSER_WORKER_KEY is not set — /api/* will return 503 until it is set.');
 });
 

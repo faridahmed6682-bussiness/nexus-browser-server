@@ -2,4 +2,6 @@
 .env
 github-installations.json
 github-installations.json.tmp
+search-quota.json
+search-quota.json.tmp
 node_modules/

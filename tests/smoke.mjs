@@ -17,6 +17,12 @@
 
 import http from 'node:http';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+// Search (lib/search.js): cases 23-24 are in-process unit tests — no
+// network, no CSE quota spent. Case 25 is the live HTTP check.
+import { createQuotaTracker, parseDuckDuckGoHtml, isDuckDuckGoBlockPage, searchWeb, CSE_DAILY_LIMIT } from '../lib/search.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const API_KEY = process.env.TEST_API_KEY || '';
@@ -397,6 +403,142 @@ async function main() {
     report('20. POST /api/job/:id/cancel terminal job -> 400', true);
   } catch (err) {
     report('20. POST /api/job/:id/cancel terminal job -> 400', false, err.message);
+  }
+
+  // (21) POST /api/search without key -> 401
+  try {
+    const r = await request({
+      method: 'POST', path: '/api/search',
+      body: { q: 'dhaka weather' },
+    });
+    assert.equal(r.status, 401, `POST /api/search without key -> ${r.status}: ${r.raw}`);
+    report('21. POST /api/search without key -> 401', true);
+  } catch (err) {
+    report('21. POST /api/search without key -> 401', false, err.message);
+  }
+
+  // (22) POST /api/search with a bad q -> 400 (missing, empty, non-string)
+  try {
+    for (const bad of [{}, { q: '' }, { q: '   ' }, { q: 123 }, { q: 'x'.repeat(501) }]) {
+      const r = await request({
+        method: 'POST', path: '/api/search',
+        headers: auth,
+        body: bad,
+      });
+      assert.equal(r.status, 400, `POST /api/search q=${JSON.stringify(bad).slice(0, 30)} -> ${r.status}: ${r.raw}`);
+    }
+    report('22. POST /api/search bad q (missing/empty/non-string/too long) -> 400', true);
+  } catch (err) {
+    report('22. POST /api/search bad q (missing/empty/non-string/too long) -> 400', false, err.message);
+  }
+
+  // (23) In-process: parseDuckDuckGoHtml decodes DDG's uddg-wrapped
+  // links, strips tags/entities, and zips snippets by position.
+  try {
+    const canned = `
+<div class="result results_links results_links_deep web-result">
+<div class="links_main links_deep result__body">
+<h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdhaka&amp;rut=abc">Dhaka Weather &amp; Forecast</a></h2>
+<a class="result__snippet" href="https://example.com/dhaka">Today in Dhaka: 28C, light rain and humidity.</a>
+</div></div>
+<div class="result results_links results_links_deep web-result">
+<div class="links_main links_deep result__body">
+<h2 class="result__title"><a rel="nofollow" class="result__a" href="https://example.org/bangladesh">Bangladesh News</a></h2>
+<a class="result__snippet" href="https://example.org/bangladesh">Latest headlines from Bangladesh.</a>
+</div></div>`;
+    const parsed = parseDuckDuckGoHtml(canned);
+    assert.equal(parsed.length, 2, `expected 2 results, got: ${JSON.stringify(parsed)}`);
+    assert.equal(parsed[0].url, 'https://example.com/dhaka', `uddg must decode, got: ${parsed[0].url}`);
+    assert.equal(parsed[0].title, 'Dhaka Weather & Forecast', `title entities must decode, got: ${parsed[0].title}`);
+    assert.equal(parsed[0].snippet, 'Today in Dhaka: 28C, light rain and humidity.');
+    assert.equal(parsed[1].url, 'https://example.org/bangladesh');
+    assert.equal(parsed[1].snippet, 'Latest headlines from Bangladesh.');
+    assert.equal(parseDuckDuckGoHtml('<html><body>no results here</body></html>').length, 0);
+    report('23. parseDuckDuckGoHtml decodes uddg links + titles + snippets', true);
+  } catch (err) {
+    report('23. parseDuckDuckGoHtml decodes uddg links + titles + snippets', false, err.message);
+  }
+
+  // (24) In-process: the CSE quota tracker blocks the 101st call and
+  // resets at midnight UTC. No real quota is spent (temp state file).
+  try {
+    assert.equal(CSE_DAILY_LIMIT, 100, `CSE_DAILY_LIMIT must be 100, got: ${CSE_DAILY_LIMIT}`);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cse-quota-'));
+    const stateFile = path.join(dir, 'search-quota.json');
+    const tracker = createQuotaTracker(stateFile);
+    assert.equal(tracker.remaining(), 100, `fresh tracker must have 100 left, got: ${tracker.remaining()}`);
+    assert.equal(tracker.canUse(), true);
+    for (let i = 0; i < 100; i += 1) tracker.recordUse();
+    assert.equal(tracker.usedToday(), 100);
+    assert.equal(tracker.remaining(), 0, `after 100 uses, remaining must be 0, got: ${tracker.remaining()}`);
+    assert.equal(tracker.canUse(), false, 'the 101st CSE call must be blocked');
+    // A fresh tracker on the same file reads the persisted count back.
+    const tracker2 = createQuotaTracker(stateFile);
+    assert.equal(tracker2.remaining(), 0, 'persisted state must survive a restart');
+    // Yesterday's state resets to a full 100.
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    fs.writeFileSync(stateFile, JSON.stringify({ date: yesterday, used: 100 }));
+    const tracker3 = createQuotaTracker(stateFile);
+    assert.equal(tracker3.remaining(), 100, `new UTC day must reset to 100, got: ${tracker3.remaining()}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+    report('24. CSE quota tracker: 100/day, 101st blocked, midnight UTC reset', true);
+  } catch (err) {
+    report('24. CSE quota tracker: 100/day, 101st blocked, midnight UTC reset', false, err.message);
+  }
+
+  // (25) Live HTTP: POST /api/search with CSE unconfigured -> DuckDuckGo.
+  // The sandbox may block outbound network to DDG: then the server
+  // answers 502 (both providers unreachable) and the case still passes
+  // with a note — the real DDG path is verified on Railway/Render
+  // after deploy, where outbound network works.
+  try {
+    const r = await request({
+      method: 'POST', path: '/api/search',
+      headers: auth,
+      body: { q: 'dhaka weather' },
+    });
+    if (r.status === 200) {
+      assert.equal(r.body.provider, 'duckduckgo', `CSE unconfigured, provider must be duckduckgo, got: ${r.raw}`);
+      assert.ok(Array.isArray(r.body.results), `results must be an array, got: ${r.raw}`);
+      assert.equal(r.body.quotaRemaining, null, `quotaRemaining must be null when CSE is unconfigured, got: ${r.raw}`);
+      report('25. POST /api/search (CSE unconfigured) -> 200, provider duckduckgo', true, `${r.body.results.length} results`);
+    } else {
+      assert.equal(r.status, 502, `POST /api/search -> ${r.status}: ${r.raw}`);
+      assert.ok(typeof r.body.error === 'string' && /Search failed|খোঁজা যায়নি/.test(r.body.error),
+        `502 error must explain the search failure, got: ${r.raw}`);
+      report('25. POST /api/search (CSE unconfigured) -> 502, DDG unreachable from sandbox', true, 'live DDG path needs Railway/Render');
+    }
+  } catch (err) {
+    report('25. POST /api/search (CSE unconfigured) -> 200 duckduckgo or 502', false, err.message);
+  }
+
+  // (26) In-process: the DDG bot-check page is detected, and a 202 on
+  // the first attempt is retried once (stub fetch — no network, no quota).
+  try {
+    const blockPage = '<html><head><title>\n        DuckDuckGo\n    </title></head><body>no results</body></html>';
+    const goodPage = '<a rel="nofollow" class="result__a" href="https://example.com/a">Alpha</a><a class="result__snippet" href="https://example.com/a">Alpha snippet.</a><a rel="nofollow" class="result__a" href="https://example.com/b">Beta</a><a class="result__snippet" href="https://example.com/b">Beta snippet.</a>';
+    const normalNoResults = '<html><head><title>zxqvjk at DuckDuckGo</title></head><body>no results found</body></html>';
+    assert.equal(isDuckDuckGoBlockPage(blockPage), true, 'bare-title page with no links must be a block page');
+    assert.equal(isDuckDuckGoBlockPage(normalNoResults), false, 'a genuine no-results page must NOT be a block page');
+    assert.equal(isDuckDuckGoBlockPage(goodPage), false, 'a results page must NOT be a block page');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cse-retry-'));
+    const tracker = createQuotaTracker(path.join(dir, 'search-quota.json'));
+    let calls = 0;
+    const flakyFetch = async () => {
+      calls += 1;
+      if (calls === 1) return { status: 202, text: async () => blockPage };
+      return { status: 200, text: async () => goodPage };
+    };
+    const r1 = await searchWeb('test query', { tracker, fetchImpl: flakyFetch });
+    assert.equal(calls, 2, `202 must be retried once (calls=${calls})`);
+    assert.equal(r1.provider, 'duckduckgo');
+    assert.equal(r1.results.length, 2, `expected 2 results after retry, got: ${JSON.stringify(r1.results)}`);
+    const alwaysBlocked = async () => ({ status: 202, text: async () => blockPage });
+    await assert.rejects(searchWeb('test query', { tracker, fetchImpl: alwaysBlocked }), /blocked|HTTP 202/);
+    fs.rmSync(dir, { recursive: true, force: true });
+    report('26. DDG bot-check detected; 202 retried once, persistent block throws', true);
+  } catch (err) {
+    report('26. DDG bot-check detected; 202 retried once, persistent block throws', false, err.message);
   }
 }
 

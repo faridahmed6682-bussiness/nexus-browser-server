@@ -77,6 +77,39 @@ Fetch a URL and return its readable text — the simple case:
 Errors are always `{ok:false, error:"..."}` (401 bad key, 429 queue full,
 400 bad request, 500/503 failure).
 
+### `POST /api/search` (auth)
+Search the web — Google Custom Search first (free plan, 100 queries/day),
+DuckDuckGo HTML automatically when the free quota is used up, Google
+returns an error, or the CSE keys are not set. Body:
+
+```json
+{"q": "ঢাকা আবহাওয়া"}
+```
+
+Response:
+
+```json
+{"ok": true, "provider": "google", "results": [{"title": "...", "url": "https://...", "snippet": "..."}], "quotaRemaining": 97}
+```
+
+`provider` is `"google"` or `"duckduckgo"`; `quotaRemaining` is the CSE
+calls left today (`null` when CSE is not configured). The CSE key is
+never logged or returned. On total failure (both providers down) the
+answer is 502 and the app falls back to opening the DuckDuckGo search
+URL in the browser worker, exactly as before. DuckDuckGo stays the
+browser homepage/default — this endpoint only changes how a search
+query is answered.
+
+Setup (the two values only the user can create — the server can never
+create them): in Google Cloud, enable the Custom Search API, create an
+API key, then at programmablesearchengine.google.com create a search
+engine (search the entire web) and copy its Search engine ID (`cx`).
+Set them as env vars: `GOOGLE_CSE_API_KEY` and `GOOGLE_CSE_CX`.
+Without them search still works — DuckDuckGo only. The daily quota
+(100/day, midnight UTC) is counted in `search-quota.json` (gitignored
+runtime state, same pattern as `github-installations.json`); when it
+runs out, DuckDuckGo answers until midnight. Code: `lib/search.js`.
+
 ## Browser upgrades — long jobs, screenshots, form fill, downloads
 
 The old `/api/browse` and `/api/read` endpoints above are unchanged (one
