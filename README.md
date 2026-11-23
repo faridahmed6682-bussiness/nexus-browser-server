@@ -78,9 +78,8 @@ Errors are always `{ok:false, error:"..."}` (401 bad key, 429 queue full,
 400 bad request, 500/503 failure).
 
 ### `POST /api/search` (auth)
-Search the web — Google Custom Search first (free plan, 100 queries/day),
-DuckDuckGo HTML automatically when the free quota is used up, Google
-returns an error, or the CSE keys are not set. Body:
+Search the web — an 11-leg chain of free, no-card providers, tried in
+this fixed order; the first leg returning non-empty results wins. Body:
 
 ```json
 {"q": "ঢাকা আবহাওয়া"}
@@ -89,26 +88,84 @@ returns an error, or the CSE keys are not set. Body:
 Response:
 
 ```json
-{"ok": true, "provider": "google", "results": [{"title": "...", "url": "https://...", "snippet": "..."}], "quotaRemaining": 97}
+{"ok": true, "provider": "tavily", "results": [{"title": "...", "url": "https://...", "snippet": "..."}], "quotaRemaining": null}
 ```
 
-`provider` is `"google"` or `"duckduckgo"`; `quotaRemaining` is the CSE
-calls left today (`null` when CSE is not configured). The CSE key is
-never logged or returned. On total failure (both providers down) the
-answer is 502 and the app falls back to opening the DuckDuckGo search
-URL in the browser worker, exactly as before. DuckDuckGo stays the
-browser homepage/default — this endpoint only changes how a search
-query is answered.
+Chain order (each leg in its own try/catch; an error or an empty
+answer falls through to the next leg):
 
-Setup (the two values only the user can create — the server can never
-create them): in Google Cloud, enable the Custom Search API, create an
-API key, then at programmablesearchengine.google.com create a search
-engine (search the entire web) and copy its Search engine ID (`cx`).
-Set them as env vars: `GOOGLE_CSE_API_KEY` and `GOOGLE_CSE_CX`.
-Without them search still works — DuckDuckGo only. The daily quota
+1. **Tavily** (`TAVILY_API_KEY`) — free-tier key, email signup, no card.
+2. **Exa** (`EXA_API_KEY`) — free-tier key, email signup, no card.
+3. **Firecrawl** (`FIRECRAWL_API_KEY`) — free-tier key, email signup, no card.
+4. **Marginalia** — no key, no setup (small-web index; results skew to
+   small/independent sites). It uses Marginalia's shared `public`
+   API key, so 429/503 rate limits under load are normal — the leg
+   just falls through.
+5. **SearXNG** (`SEARXNG_URL`) — self-hosted instance URL; leg skipped
+   when unset.
+6. **Mojeek** — no key, no setup (HTML scrape; may be blocked from
+   datacenter IPs — it already returned 403 to a direct fetch from
+   the build environment, and its robots.txt disallows `/search`, so
+   treat this leg as best-effort; a block falls through like any
+   other leg).
+7. **Bing RSS** — no key, no setup (RSS scrape; same blocking caveat —
+   the general-search `?format=rss` endpoint was not confirmed live
+   from the build environment, so also best-effort).
+8. **Brave Search** (`BRAVE_SEARCH_API_KEY`) — free plan, monthly
+   allowance; **dormant without a key, see below**.
+9. **Google Custom Search** (`GOOGLE_CSE_API_KEY` + `GOOGLE_CSE_CX`) —
+   free plan, 100 queries/day; **dormant, see below**.
+10. **DuckDuckGo HTML** — no key, no setup (plain HTTP, no JS).
+11. **Wikipedia** — no key, no setup (last resort; encyclopaedia
+    summaries, not general web results).
+
+`provider` is one of `"tavily"`, `"exa"`, `"firecrawl"`,
+`"marginalia"`, `"searxng"`, `"mojeek"`, `"bing"`, `"brave"`,
+`"google"`, `"duckduckgo"` or `"wikipedia"`; `quotaRemaining` is the
+CSE calls left today (`null` for every leg except Google — and `null`
+for Google too when CSE is not configured). A key-gated leg is
+**skipped, not attempted**, when its key/env var is unset. The keys
+are never logged or returned. On total failure (all eleven legs down
+or empty) the answer is 502 and the app falls back to opening the
+DuckDuckGo search URL in the browser worker, exactly as before.
+DuckDuckGo stays the browser homepage/default — this endpoint only
+changes how a search query is answered.
+
+Setup — Tavily / Exa / Firecrawl (legs 1–3): free tier, email signup,
+no card. Create a key at https://tavily.com, https://exa.ai or
+https://firecrawl.dev (dashboard → API keys) and set it as env var
+`TAVILY_API_KEY`, `EXA_API_KEY` or `FIRECRAWL_API_KEY`. Leave any of
+them empty and that leg is skipped.
+
+Setup — SearXNG (leg 5): set `SEARXNG_URL` to the base URL of a
+SearXNG instance (e.g. `https://searxng.example.com`); the plan is a
+self-hosted instance on Render free. The instance MUST have JSON
+output enabled (`search.formats` including `json` in `settings.yml` —
+off by default), or every call answers 403 and the leg falls through.
+Leave it empty and the leg is skipped. No key is involved.
+
+Setup — Brave (leg 8, dormant): create a key at
+https://api-dashboard.search.brave.com and set it as env var
+`BRAVE_SEARCH_API_KEY`. NOTE: Brave's FAQ (brave.com/search/api/) says
+a credit card IS required at signup even for the free plan (anti-fraud,
+not charged). The user has no card, so a real Brave key may be
+unobtainable — without it the Brave leg is simply skipped and the
+earlier free legs answer instead.
+
+Setup — Google CSE (leg 9, dormant): in Google Cloud, enable the
+Custom Search API, create an API key, then at
+programmablesearchengine.google.com create a search engine (search the
+entire web) and copy its Search engine ID (`cx`). Set them as env vars:
+`GOOGLE_CSE_API_KEY` and `GOOGLE_CSE_CX`. LIMITATION: whole-web search
+is deprecated for new engines — the engine created for Nexus searches
+ONLY example.com (forced placeholder; the switch is greyed out), so
+unless domains are added to that engine this leg is effectively
+dormant and the vars are left unset on the hosts. Without them the
+chain still works — the free legs above answer. The daily quota
 (100/day, midnight UTC) is counted in `search-quota.json` (gitignored
 runtime state, same pattern as `github-installations.json`); when it
-runs out, DuckDuckGo answers until midnight. Code: `lib/search.js`.
+runs out, DuckDuckGo/Wikipedia answer until midnight. Code:
+`lib/search.js` + `lib/free-providers.js`.
 
 ## Browser upgrades — long jobs, screenshots, form fill, downloads
 
@@ -568,6 +625,11 @@ never store the App private key on the phone.
 | `BROWSER_AGENT_GEMINI_KEY` | Only for AI Studio builds | — | Build agent's **own dedicated Gemini key** — never a chat agent's key. |
 | `BROWSER_AGENT_OPENROUTER_KEY` | No | — | Build agent's own dedicated OpenRouter key (last failover leg). |
 | `BROWSER_AGENT_RPM_BUDGET` | No | `30` | Build agent's per-model RPM budget for failover rotation. |
+| `BRAVE_SEARCH_API_KEY` | Only for Brave Search | — | Search leg 8 (free plan, monthly allowance; signup card-gated — see MANIFEST). Without it the Brave leg is skipped and the earlier free legs answer. Note: Brave requires a credit card at signup even for the free plan. |
+| `TAVILY_API_KEY` | Only for Tavily search (leg 1) | — | Free-tier key, email signup, no card (https://tavily.com). Without it the Tavily leg is skipped. |
+| `EXA_API_KEY` | Only for Exa search (leg 2) | — | Free-tier key, email signup, no card (https://exa.ai). Without it the Exa leg is skipped. |
+| `FIRECRAWL_API_KEY` | Only for Firecrawl search (leg 3) | — | Free-tier key, email signup, no card (https://firecrawl.dev). Without it the Firecrawl leg is skipped. |
+| `SEARXNG_URL` | Only for SearXNG search (leg 5) | — | Base URL of a self-hosted SearXNG instance (no key). Without it the SearXNG leg is skipped. |
 
 ## Honest limits (free tiers)
 
