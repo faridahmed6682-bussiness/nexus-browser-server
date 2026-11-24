@@ -491,6 +491,166 @@ checks for the cancel between steps and stops; the job stays
 unknown id; 400 if the job is already terminal
 (`done` / `failed` / `cancelled`).
 
+## Browser-interaction loop (general web tasks)
+
+A separate agent that drives **any web task end-to-end on the server**
+— it opens pages, reads them, clicks, types, fills forms and reports
+back, one action at a time. Code: `lib/browser-agent.js` (the loop
+engine) + `lib/browser-loop.js` (accessibility-tree snapshots,
+grounding, duplicate trials) + `lib/guardrails.js` (the safety checks)
++ `lib/agent-llm.js` (the shared LLM client — the same dedicated keys
+and failover chain as the build agent). The old `/api/browse` path
+cannot do this — it only runs a scripted list of steps and returns
+text; the loop is what decides each next step itself.
+
+**How it sees a page (Meta-documented).** The loop's only view of a
+page is an **accessibility-tree snapshot** — roles, accessible names
+and states (`button, "Add to cart"`), never the raw DOM, never a
+screenshot, never JavaScript in the page. It grounds every element by
+role + accessible name in that tree. After every action it takes a
+**fresh snapshot** and diffs it against the one before, so the job
+record shows what each step actually changed. Screenshots exist only
+for your live view: the loop attaches a small one to the job result,
+but it is never fed to the model.
+
+**The loop, step by step.** Observe (snapshot) → guardrails → ask the
+dedicated LLM for **exactly one action** from the fixed vocabulary
+below → act → fresh snapshot → repeat. The LLM never runs code and
+never chooses selectors — all grounding and all browser calls live in
+the engine.
+
+**Action vocabulary** (fixed — Nexus's own choice; Meta publishes no
+vocabulary):
+
+| Action | Parameters | What it does |
+|---|---|---|
+| `navigate` | `url` | Open a page |
+| `click` | `role`, `name` | Click the named element |
+| `type` | `role`, `name`, `text` | Clear the field, then type |
+| `select` | `role`, `name`, `value` | Pick a dropdown option |
+| `scroll` | `direction` (`up` / `down`) | Scroll the page |
+| `back` | — | Browser back |
+| `wait` | `ms` (max 10000) | Pause |
+| `screenshot` | — | Small screenshot for your live view only |
+| `done` | `summary` | Task achieved — finish |
+| `fail` | `reason` | Stuck — finish with an explanation |
+
+**Limits — Nexus's own choices (Meta publishes none of these).**
+At most **30 steps** per job; **15 s** per browser operation,
+**20 s** per LLM call; cancel and the deadline are checked between
+every step. There is **no silent retry of the same failed click**: a
+target that failed is never acted on again in the same run — the loop
+re-reads the tree and must try a different element, reroute to another
+site, or fail with an explanation. After 3 failed actions in a row it
+stops. Duplicate buttons with the same name are tried one at a time
+(at most 3 trials), learning from the fresh tree after each try.
+
+**What is Meta-documented vs what Nexus chose.** Documented by Meta:
+tree-only perception; grounding by role + name; re-reading after an
+action; rerouting to another retailer (or reporting failure) instead
+of retrying a blocked step; checkout detection prompting human
+approval with the exact purchase details; never circumventing a
+CAPTCHA/paywall; OTPs unreadable to the agent by design (you take
+control); shopping searches excluding Amazon by default. Nexus's own
+choices: the vocabulary above, the 30-step cap, all timeouts, the
+no-retry and 3-failure rules, the shopping-task heuristic, and the
+checkout scoping below.
+
+### `POST /api/agent/browse` (auth)
+
+Create a browse job. Returns **202** `{"jobId": "..."}`. The app polls
+`GET /api/job/:id` for the result (same job shape as `/api/job`).
+
+```json
+{
+  "task": "Find the cheapest granola bars per piece on Walmart and Target",
+  "url": "https://www.walmart.com/",
+  "cookies": [{"name": "session", "value": "YOUR_COOKIE_VALUE", "domain": ".walmart.com"}],
+  "maxMinutes": 10,
+  "fcmToken": "optional-device-token"
+}
+```
+
+- `task` — **required**, non-empty string, max **4000** characters.
+- `url` — optional; when absent the loop starts on `about:blank` and
+  navigates — to a URL named in the task, or one it chooses.
+- `cookies` — optional array of session cookies, applied to the browse
+  browser context and harvested back into the job result.
+- `maxMinutes` — optional number, default **10**, clamped to **1–20**.
+  The job timeout is `maxMinutes` + 2 minutes of agent overhead.
+- `fcmToken` — optional string; same push behaviour as other jobs.
+
+Errors: 400 bad input (BN+EN message); 429 too many jobs. There is
+**no 503 when the agent LLM key is unconfigured** — the job is still
+created and finishes fast with status `not-configured`.
+
+### Polling — `GET /api/job/:id` (auth)
+
+Same as any other job. The browse result is in `result`:
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "type": "browser-loop",
+  "status": "done",
+  "progress": 100,
+  "steps": [{"t": "...", "text": "ধাপ 3: click button \"Add to cart\" — +2 button \"Checkout\", …"}],
+  "result": {"ok": true, "status": "done", "summary": "...", "finalUrl": "https://...", "stepsTaken": 7, "cookies": [], "screenshotBase64": "..."},
+  "error": null
+}
+```
+
+`result.status` is one of:
+
+| Status | Meaning |
+|---|---|
+| `done` | Task achieved (`summary` + `finalUrl` in the result) |
+| `failed` | Stopped with an explanation (`error`) — element not found, step cap hit, repeated failures, Amazon with no alternative, LLM unavailable |
+| `blocked` | A bot check / CAPTCHA, or suspicious instruction-like page text, stopped the run — a human is needed; the agent never tries to bypass it |
+| `needs-approval` | A checkout / purchase was reached — the run stopped **before** submitting, with the exact visible purchase details in `details`; approve it in the app, never here |
+| `needs-user` | A one-time code, or a password/secret field, is needed — the agent cannot read codes from your inbox and never types passwords; take control and do that step yourself |
+| `needs-confirmation` | **Interim only, while the job is still `running`:** a high-risk form was filled and the submit is paused — the filled values are in `result.filledValues` for your review (password fields show `[hidden]`); answer `POST /api/agent/browse/:id/confirm` |
+| `cancelled` | Stopped by you (`POST /api/job/:id/cancel`, or you declined a confirmation) |
+| `timeout` | The `maxMinutes` window ran out |
+| `not-configured` | The server has no `BROWSER_AGENT_GEMINI_KEY` set (same dedicated-key table as the build agent) |
+
+### `POST /api/agent/browse/:id/confirm` (auth)
+
+Answer a paused high-risk form submit. Body:
+
+```json
+{"confirmed": true}
+```
+
+- `confirmed: true` — the run continues and performs the submit.
+- `confirmed: false` — the run is cancelled.
+
+Returns `{"ok": true, "status": "resumed"}` (or `"cancelled"`).
+**404** when the id is unknown **or** the job is not currently paused
+waiting for confirmation; 400 when `confirmed` is not `true`/`false`.
+The final outcome is visible by polling `GET /api/job/:id`
+afterwards. A paused run waits only within its own deadline and the
+job timeout — if you never answer, the loop times out.
+
+**Guardrails (what stops the run, and when).** Before every action the
+loop checks the fresh snapshot: suspicious instruction-like page text
+(a prompt-injection scan — page text is never treated as agent
+instructions) or a bot check stops it as `blocked`; a one-time-code
+request stops it as `needs-user`. Checkout is scoped: a checkout
+signal on a page that *is* a checkout (checkout-like URL, or a payment
+field on the page) stops the run as `needs-approval` — a shop header's
+"Checkout" link alone does not, or no store homepage could ever be
+browsed. The fail-closed point is the submit itself: before any
+submit-like click, any checkout signal stops the run, a pay/buy click
+always stops it, and a high-risk form (money, identity documents,
+account creation with a password, irreversible actions — classified by
+`lib/guardrails.js`) is filled but **not** submitted without your
+confirmation. Shopping searches never route to Amazon by default: when
+the task is a shopping search and the loop lands on (or is told to
+open) an Amazon URL, it reroutes to another retailer named in the
+task instead — and fails with an explanation when the task names no
+alternative.
+
 ## Calling it from the Nexus app (Kotlin / OkHttp)
 
 ```kotlin
@@ -669,6 +829,10 @@ never store the App private key on the phone.
 | `lib/sessions.js` | Per-request cookies: apply to a fresh context, harvest back, never stored. |
 | `lib/screenshot.js` | Small cropped JPEGs: quality 50 (max 60), max 480 px wide, 800×600 viewport cap. |
 | `lib/formfill.js` | Form fill: password guard, payment guard (never clicks a pay button). |
+| `lib/agent-llm.js` | Shared LLM client (dedicated keys, failover chain, per-leg HTTP calls) for the build agent and the browser loop. |
+| `lib/browser-agent.js` | General browser-interaction loop: observe → one action → fresh snapshot, guardrails, confirm pause. |
+| `lib/browser-loop.js` | Accessibility-tree snapshots, diffs, role+name grounding, duplicate trials. |
+| `lib/guardrails.js` | Pure guardrail checks: injection scan, checkout / bot-check / OTP detection, Amazon check, form-risk classification. |
 | `lib/downloads.js` | File capture: base64 out, 8 MB max, temp file always deleted. |
 | `lib/stealth.js` | Desktop-Chrome fingerprint + human-like mouse/typing. |
 | `docs/KEEP_ALIVE.md` | Keep-alive with free cron-job.org (BN+EN) + honest credit note. |
