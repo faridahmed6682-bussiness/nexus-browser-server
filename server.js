@@ -46,6 +46,7 @@ const { captureDownload } = require('./lib/downloads');
 const { fillForm } = require('./lib/formfill');
 const { sendPush, maskToken } = require('./lib/push');
 const { runAiStudioBuild, isAgentLlmConfigured, agentLlmStatus } = require('./lib/aistudio-agent');
+const { runBrowserLoop, confirmBrowserLoop, getPausedConfirmation } = require('./lib/browser-agent');
 const { searchWeb, searchStatus } = require('./lib/search');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -214,6 +215,9 @@ const CAPTCHA_PAUSE_BN_EN = 'ক্যাপচা যাচাই দরকা�
 const SYNC_TIMEOUT_BN_EN = 'সময় শেষ — ৬০ সেকেন্ড পেরিয়ে গেছে · Timed out after 60 seconds';
 const INVALID_FIELDS_BN_EN = 'fields একটি অ্যারে হতে হবে · fields must be an array';
 const INVALID_PROMPT_BN_EN = 'প্রম্পট দরকার — খালি নয়, সর্বোচ্চ ৮০০০ অক্ষর · prompt is required — non-empty string, max 8000 characters';
+const INVALID_TASK_BN_EN = 'কাজের নির্দেশনা দরকার — খালি নয়, সর্বোচ্চ ৪০০০ অক্ষর · task is required — non-empty string, max 4000 characters';
+const BROWSE_NOT_PAUSED_BN_EN = 'এই ব্রাউজিং কাজটি নিশ্চিতকরণের অপেক্ষায় নেই · This browse job is not waiting for confirmation';
+const INVALID_CONFIRMED_BN_EN = 'confirmed true বা false হতে হবে · confirmed must be true or false';
 const INVALID_COOKIES_BN_EN = 'cookies একটি অ্যারে হতে হবে · cookies must be an array';
 const INVALID_MAX_MINUTES_BN_EN = 'maxMinutes একটি সংখ্যা হতে হবে · maxMinutes must be a number';
 const INVALID_FCM_TOKEN_BN_EN = 'fcmToken একটি স্ট্রিং হতে হবে · fcmToken must be a string';
@@ -610,7 +614,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'nexus-browser-worker',
-    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/search', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/job/:id/cancel', 'POST /api/agent/build', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations', 'POST /api/notify'],
+    endpoints: ['GET /health', 'POST /api/browse', 'POST /api/read', 'POST /api/search', 'POST /api/job', 'GET /api/job/:id', 'GET /api/jobs', 'POST /api/job/:id/resume', 'POST /api/job/:id/cancel', 'POST /api/agent/build', 'POST /api/agent/browse', 'POST /api/agent/browse/:id/confirm', 'POST /api/screenshot', 'POST /api/fill', 'POST /github/webhook', 'POST /api/github/installation-token', 'GET /api/github/installations', 'POST /api/notify'],
   });
 });
 
@@ -832,6 +836,101 @@ function createAgentBuild(req, res) {
 }
 
 app.post('/api/agent/build', requireAuth, createAgentBuild);
+
+// ---------------------------------------------------------------------------
+// Browser-interaction loop agent (server-side, lib/browser-agent.js).
+// POST /api/agent/browse creates a long 'browser-loop' job that drives a
+// general web task end-to-end: observe the page as an accessibility-tree
+// snapshot -> ask the dedicated LLM for ONE action from a fixed
+// vocabulary -> act -> fresh snapshot -> repeat (max 30 steps — a Nexus
+// choice; Meta publishes no step cap). Same dedicated LLM keys as the
+// build agent (BROWSER_AGENT_GEMINI_KEY, BROWSER_AGENT_OPENROUTER_KEY),
+// never the chat agents' keys and never Groq. Same job pattern as
+// /api/agent/build: no 503 when the key is unconfigured — the job
+// finishes fast with status 'not-configured'.
+// Guardrails (lib/guardrails.js) stop the run before a consequential
+// step: bot check / injection -> 'blocked'; checkout -> 'needs-approval';
+// OTP -> 'needs-user'. A high-risk form submit pauses the run with
+// status 'needs-confirmation' (filled values shown for review) until
+// the app answers POST /api/agent/browse/:id/confirm.
+// ---------------------------------------------------------------------------
+const AGENT_BROWSE_MAX_TASK_CHARS = 4000;
+
+function createAgentBrowse(req, res) {
+  const body = req.body || {};
+  const { task, url, cookies, maxMinutes, fcmToken } = body;
+  if (typeof task !== 'string' || !task.trim() || task.length > AGENT_BROWSE_MAX_TASK_CHARS) {
+    return res.status(400).json({ error: INVALID_TASK_BN_EN });
+  }
+  // url is optional: when absent, the loop starts on about:blank and the
+  // agent navigates — to a URL named in the task, or one it chooses.
+  if (url !== undefined && !isHttpUrl(url)) {
+    return res.status(400).json({ error: INVALID_URL_BN_EN });
+  }
+  if (cookies !== undefined && !Array.isArray(cookies)) {
+    return res.status(400).json({ error: INVALID_COOKIES_BN_EN });
+  }
+  if (maxMinutes !== undefined && (typeof maxMinutes !== 'number' || Number.isNaN(maxMinutes))) {
+    return res.status(400).json({ error: INVALID_MAX_MINUTES_BN_EN });
+  }
+  if (fcmToken !== undefined && typeof fcmToken !== 'string') {
+    return res.status(400).json({ error: INVALID_FCM_TOKEN_BN_EN });
+  }
+  const minutes = maxMinutes === undefined
+    ? 10
+    : Math.max(1, Math.min(20, Math.floor(maxMinutes)));
+  const jobId = jobs.createJob('browser-loop', {
+    type: 'browser-loop',
+    task,
+    url,
+    cookies,
+    maxMinutes: minutes,
+    fcmToken: typeof fcmToken === 'string' ? fcmToken : undefined,
+    // Per-job timeout: the browse window plus 2 minutes of agent overhead.
+    timeoutMs: minutes * 60 * 1000 + 120000,
+  });
+  if (!jobId) {
+    return res.status(429).json({ error: TOO_MANY_JOBS_BN_EN });
+  }
+  const job = jobs.getJob(jobId);
+  // Fire and forget: the app polls GET /api/job/:id for the result.
+  jobs.runJob(job, (j, update) => runBrowserLoop(j, update, {
+    getPool,
+    applyCookies,
+    harvestCookies,
+    applyStealth,
+    takeSmallScreenshot,
+    isChallengePage,
+  })).catch(() => {});
+  return res.status(202).json({ jobId });
+}
+
+app.post('/api/agent/browse', requireAuth, createAgentBrowse);
+
+// Confirm (or decline) a paused high-risk form submit. The loop holds
+// the browser while it waits, so this only answers runs that are
+// actually paused in lib/browser-agent.js's in-memory map: an unknown
+// id, or an id that is not paused, is 404. confirmed=true resumes the
+// run to the submit; false cancels it. The final outcome is visible by
+// polling GET /api/job/:id afterwards.
+function confirmAgentBrowse(req, res) {
+  const job = jobs.getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: JOB_NOT_FOUND_BN_EN });
+  if (!getPausedConfirmation(req.params.id)) {
+    return res.status(404).json({ error: BROWSE_NOT_PAUSED_BN_EN });
+  }
+  const confirmed = (req.body || {}).confirmed;
+  if (typeof confirmed !== 'boolean') {
+    return res.status(400).json({ error: INVALID_CONFIRMED_BN_EN });
+  }
+  // The pause may have resolved (timeout / cancel) between the check
+  // above and this call — then the run is no longer paused.
+  const resumed = confirmBrowserLoop(req.params.id, confirmed);
+  if (!resumed) return res.status(404).json({ error: BROWSE_NOT_PAUSED_BN_EN });
+  return res.json({ ok: true, status: confirmed ? 'resumed' : 'cancelled' });
+}
+
+app.post('/api/agent/browse/:id/confirm', requireAuth, confirmAgentBrowse);
 
 // STOP: cancel a running/queued/paused job. The agent checks
 // job._cancelled between steps and stops; runJob() keeps the 'cancelled'
