@@ -26,6 +26,13 @@ import path from 'node:path';
 // (Tavily -> Exa -> Firecrawl -> Marginalia -> SearXNG -> Mojeek ->
 // Bing RSS -> Brave -> CSE -> DuckDuckGo -> Wikipedia) — stub fetchImpl,
 // no network, no keys spent.
+// Cases 44-48 are the browser-interaction loop cases. Case 48
+// assumes the same no-BROWSER_AGENT_*-keys start as cases 17-18 (the
+// loop job ends 'not-configured' fast and no browser is launched).
+// Case 47 is an in-process module-load check: it requires the loop
+// modules (lib/browser-agent.js + lib/guardrails.js +
+// lib/browser-loop.js) and asserts the interfaces the loop engine
+// calls — it needs no network and no keys.
 import { createQuotaTracker, parseDuckDuckGoHtml, isDuckDuckGoBlockPage, searchWeb, CSE_DAILY_LIMIT } from '../lib/search.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -1349,6 +1356,115 @@ async function main() {
     report('43. Marginalia 200 empty results -> SearXNG 200, provider searxng', true);
   } catch (err) {
     report('43. Marginalia 200 empty results -> SearXNG 200, provider searxng', false, err.message);
+  }
+
+  // (44) POST /api/agent/browse without key -> 401
+  try {
+    const r = await request({
+      method: 'POST', path: '/api/agent/browse',
+      body: { task: 'find the cheapest granola bars' },
+    });
+    assert.equal(r.status, 401, `POST /api/agent/browse without key -> ${r.status}: ${r.raw}`);
+    report('44. POST /api/agent/browse without key -> 401', true);
+  } catch (err) {
+    report('44. POST /api/agent/browse without key -> 401', false, err.message);
+  }
+
+  // (45) POST /api/agent/browse bad body -> 400: missing task, empty
+  // task, task over 4000 chars, bad url, maxMinutes non-number,
+  // cookies non-array.
+  try {
+    const bad = [
+      [{}, 'task'],
+      [{ task: '   ' }, 'task'],
+      [{ task: 'x'.repeat(4001) }, 'task'],
+      [{ task: 'find prices', url: 'not-a-url' }, 'Invalid URL'],
+      [{ task: 'find prices', maxMinutes: 'ten' }, 'maxMinutes must be a number'],
+      [{ task: 'find prices', cookies: 'not-an-array' }, 'cookies must be an array'],
+    ];
+    for (const [body, needle] of bad) {
+      const r = await request({
+        method: 'POST', path: '/api/agent/browse',
+        headers: auth,
+        body,
+      });
+      assert.equal(r.status, 400, `POST /api/agent/browse ${JSON.stringify(body).slice(0, 40)} -> ${r.status}: ${r.raw}`);
+      assert.ok(typeof r.body.error === 'string' && r.body.error.includes(needle),
+        `error must include '${needle}', got: ${r.raw}`);
+    }
+    report('45. POST /api/agent/browse bad body (missing/empty/long task, bad url, bad maxMinutes, bad cookies) -> 400', true);
+  } catch (err) {
+    report('45. POST /api/agent/browse bad body (missing/empty/long task, bad url, bad maxMinutes, bad cookies) -> 400', false, err.message);
+  }
+
+  // (46) POST /api/agent/browse/:id/confirm on an unknown id -> 404
+  // (nothing is paused for that id).
+  try {
+    const r = await request({
+      method: 'POST', path: '/api/agent/browse/00000000-0000-0000-0000-000000000000/confirm',
+      headers: auth,
+      body: { confirmed: true },
+    });
+    assert.equal(r.status, 404, `POST /api/agent/browse/:id/confirm unknown -> ${r.status}: ${r.raw}`);
+    report('46. POST /api/agent/browse/:id/confirm unknown id -> 404', true);
+  } catch (err) {
+    report('46. POST /api/agent/browse/:id/confirm unknown id -> 404', false, err.message);
+  }
+
+  // (47) In-process: the loop modules load and expose the interfaces
+  // the engine calls. No network, no keys, no browser.
+  try {
+    const { createRequire } = await import('node:module');
+    const require = createRequire(import.meta.url);
+    const agent = require('../lib/browser-agent.js');
+    const guardrails = require('../lib/guardrails.js');
+    const loop = require('../lib/browser-loop.js');
+    assert.equal(typeof agent.runBrowserLoop, 'function', 'browser-agent must export runBrowserLoop');
+    assert.equal(typeof agent.confirmBrowserLoop, 'function', 'browser-agent must export confirmBrowserLoop');
+    assert.equal(typeof agent.getPausedConfirmation, 'function', 'browser-agent must export getPausedConfirmation');
+    assert.equal(agent.MAX_LOOP_STEPS, 30, `MAX_LOOP_STEPS must be 30, got: ${agent.MAX_LOOP_STEPS}`);
+    assert.equal(agent.confirmBrowserLoop('00000000-0000-0000-0000-000000000000', true), null,
+      'confirm on an unknown id must return null');
+    assert.equal(agent.getPausedConfirmation('00000000-0000-0000-0000-000000000000'), null,
+      'no run is paused for an unknown id');
+    for (const fn of ['scanPageText', 'detectCheckout', 'detectBotCheck', 'isAmazonUrl', 'detectOtpRequest']) {
+      assert.equal(typeof guardrails[fn], 'function', `guardrails must export ${fn}`);
+    }
+    for (const fn of ['snapshotTree', 'snapshotDiff', 'groundAction', 'locatorFor', 'duplicateTrialState']) {
+      assert.equal(typeof loop[fn], 'function', `browser-loop must export ${fn}`);
+    }
+    report('47. Loop modules load: browser-agent + guardrails + browser-loop interfaces present', true);
+  } catch (err) {
+    report('47. Loop modules load: browser-agent + guardrails + browser-loop interfaces present', false, err.message);
+  }
+
+  // (48) POST /api/agent/browse with a valid task, NO agent keys ->
+  // 202, then done with result 'not-configured' (no browser launched).
+  // Requires the server to have been started without BROWSER_AGENT_*
+  // keys (see header comment). No url in the body: the loop would
+  // start on about:blank and navigate — but the config gate fires
+  // first, so nothing is launched.
+  try {
+    const r = await request({
+      method: 'POST', path: '/api/agent/browse',
+      headers: auth,
+      body: { task: 'find the cheapest granola bars' },
+    });
+    assert.equal(r.status, 202, `POST /api/agent/browse -> ${r.status}: ${r.raw}`);
+    assert.ok(r.body && typeof r.body.jobId === 'string' && r.body.jobId.length > 0,
+      `expected {jobId} in response, got: ${r.raw}`);
+    const done = await waitForTerminal(r.body.jobId, 30_000);
+    assert.equal(done.body.status, 'done', `browse job status must be 'done', got: ${done.raw}`);
+    assert.ok(done.body.result && done.body.result.status === 'not-configured',
+      `result.status must be 'not-configured', got: ${done.raw}`);
+    const errText = (done.body.result && done.body.result.error) || '';
+    assert.ok(/not configured/i.test(errText),
+      `result.error must mention the agent LLM is not configured, got: ${errText}`);
+    assert.ok(errText.includes('BROWSER_AGENT_GEMINI_KEY'),
+      `result.error must name BROWSER_AGENT_GEMINI_KEY, got: ${errText}`);
+    report('48. Browse job, no agent keys -> done / not-configured (no browser launched)', true, errText.slice(0, 80));
+  } catch (err) {
+    report('48. Browse job, no agent keys -> done / not-configured (no browser launched)', false, err.message);
   }
 }
 
